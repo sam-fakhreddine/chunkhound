@@ -2860,7 +2860,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                 existing = self._executor_get_file_by_path(
                     conn, state, str(file.path), False
                 )
-                if existing and "id" in existing:
+                if isinstance(existing, dict) and "id" in existing:
                     logger.info(
                         f"File assumed new already exists, updating: {file.path}"
                     )
@@ -2900,9 +2900,7 @@ class DuckDBProvider(SerialDatabaseProvider):
             return []
 
         base_dir = state.get("base_directory")
-        lookup_paths = [
-            normalize_path_for_lookup(str(f.path), base_dir) for f in files
-        ]
+        lookup_paths = [normalize_path_for_lookup(str(f.path), base_dir) for f in files]
         placeholders = ", ".join(["?"] * len(lookup_paths))
         rows = conn.execute(
             f"SELECT id, path FROM files WHERE path IN ({placeholders})",
@@ -2964,7 +2962,9 @@ class DuckDBProvider(SerialDatabaseProvider):
                     (
                         new_id,
                         str(file.path),
-                        file.name if hasattr(file, "name") else Path(str(file.path)).name,
+                        file.name
+                        if hasattr(file, "name")
+                        else Path(str(file.path)).name,
                         file.extension
                         if hasattr(file, "extension")
                         else Path(str(file.path)).suffix,
@@ -3015,7 +3015,9 @@ class DuckDBProvider(SerialDatabaseProvider):
                         end_line=row[6],
                         start_byte=row[7],
                         end_byte=row[8],
-                        language=Language(row[9]) if row[9] else None,
+                        # Same shape as _executor_get_chunks_by_file_id: None
+                        # when unset, so batch-path diffs behave identically.
+                        language=Language(row[9]) if row[9] else None,  # type: ignore[arg-type]
                         metadata=json.loads(row[10]) if row[10] else {},
                     )
                 )
@@ -3029,7 +3031,8 @@ class DuckDBProvider(SerialDatabaseProvider):
         """INSERT one files row and return its id (no existence handling)."""
         result = conn.execute(
             """
-            INSERT INTO files (path, name, extension, size, modified_time, content_hash, language)
+            INSERT INTO files
+                (path, name, extension, size, modified_time, content_hash, language)
             VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?)
             RETURNING id
         """,
@@ -3450,8 +3453,9 @@ class DuckDBProvider(SerialDatabaseProvider):
         _t2 = _t.perf_counter()
         # Insert from temp to main table (ids preallocated above)
         conn.execute("""
-            INSERT INTO chunks (id, file_id, chunk_type, symbol, code, start_line, end_line,
-                              start_byte, end_byte, language, metadata)
+            INSERT INTO chunks (id, file_id, chunk_type, symbol, code,
+                              start_line, end_line, start_byte, end_byte,
+                              language, metadata)
             SELECT * FROM temp_chunks
         """)
         _t3 = _t.perf_counter()
@@ -3915,9 +3919,8 @@ class DuckDBProvider(SerialDatabaseProvider):
             "WHERE e.chunk_id = c.id AND e.provider = ? AND e.model = ?)"
             for table_name in embedding_tables
         ]
-        query = (
-            "SELECT COUNT(*) FROM chunks c WHERE "
-            + " AND ".join(not_exists_clauses)
+        query = "SELECT COUNT(*) FROM chunks c WHERE " + " AND ".join(
+            not_exists_clauses
         )
         params = [provider, model] * len(embedding_tables)
         return int(conn.execute(query, params).fetchone()[0])

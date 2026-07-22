@@ -1291,9 +1291,7 @@ class IndexingCoordinator(BaseService):
             f"Batch stored {len(storable)} files / {len(inserted_ids)} chunks "
             f"in one transaction"
         )
-        for (file_id, _is_existing, _existing), count in zip(
-            prepared, per_file_counts
-        ):
+        for (file_id, _is_existing, _existing), count in zip(prepared, per_file_counts):
             file_ids.append(file_id)
             stats["total_chunks"] += count
             stats["total_files"] += 1
@@ -1676,9 +1674,10 @@ class IndexingCoordinator(BaseService):
             # remains the completeness guarantee — streamed failures degrade
             # to sweep work, never to lost embeddings.
             # CHUNKHOUND_STREAM_EMBEDDINGS=0 restores the sweep-only flow.
-            stream_embeddings = self._embedding_provider is not None and os.environ.get(
-                "CHUNKHOUND_STREAM_EMBEDDINGS", "1"
-            ) != "0"
+            stream_embeddings = (
+                self._embedding_provider is not None
+                and os.environ.get("CHUNKHOUND_STREAM_EMBEDDINGS", "1") != "0"
+            )
             embed_tasks: list[asyncio.Task[int]] = []
             # Match the sweep's parallelism so streaming never embeds with
             # less concurrency than the sequential flow it replaces.
@@ -1699,7 +1698,6 @@ class IndexingCoordinator(BaseService):
                     # serializing internally behind embed_batch's own split.
                     stream_task_chunks = provider_batch
             embed_semaphore = asyncio.Semaphore(embed_concurrency)
-            STREAM_EMBED_TASK_CHUNKS = stream_task_chunks
 
             async def _embed_pairs(pairs: list[tuple[int, dict[str, Any]]]) -> int:
                 # Embed EXACTLY the text the missing-embeddings sweep would
@@ -1774,12 +1772,10 @@ class IndexingCoordinator(BaseService):
 
                 if stream_embeddings:
                     pairs = stats_part.get("chunks_for_embedding") or []
-                    for start in range(0, len(pairs), STREAM_EMBED_TASK_CHUNKS):
+                    for start in range(0, len(pairs), stream_task_chunks):
                         embed_tasks.append(
                             asyncio.create_task(
-                                _embed_pairs(
-                                    pairs[start : start + STREAM_EMBED_TASK_CHUNKS]
-                                )
+                                _embed_pairs(pairs[start : start + stream_task_chunks])
                             )
                         )
 
