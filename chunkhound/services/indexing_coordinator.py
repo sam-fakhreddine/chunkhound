@@ -36,7 +36,7 @@ from chunkhound.core.detection import detect_language
 from chunkhound.core.diagnostics.batch_metrics import BatchMetricsCollector
 from chunkhound.core.exceptions import DiskUsageLimitExceededError
 from chunkhound.core.models import Chunk, File
-from chunkhound.core.types.common import FilePath, Language
+from chunkhound.core.types.common import FilePath, Language, Timestamp
 from chunkhound.core.utils import estimate_tokens_chunking
 from chunkhound.core.utils.path_utils import get_relative_path_safe
 from chunkhound.interfaces.database_provider import DatabaseProvider
@@ -257,6 +257,11 @@ class IndexingCoordinator(BaseService):
         self._file_locks: dict[str, asyncio.Lock] = {}
         self._locks_lock = None  # Will be initialized when first needed
 
+        # Serializes multi-dispatch DB transactions (batched store) against
+        # streamed embedding inserts so an embedding write can never land
+        # inside another task's open transaction on the single DB connection.
+        self._db_txn_lock: asyncio.Lock | None = None
+
         # Base directory for path normalization (immutable after initialization)
         # Store raw path - will resolve at usage time for consistent symlink handling
         self._base_directory: Path = base_directory
@@ -470,6 +475,12 @@ class IndexingCoordinator(BaseService):
         est = max(1000, min(int(est), 20000))
         return est
 
+    def _get_db_txn_lock(self) -> asyncio.Lock:
+        """Lazily create the DB-transaction lock inside the event loop."""
+        if self._db_txn_lock is None:
+            self._db_txn_lock = asyncio.Lock()
+        return self._db_txn_lock
+
     async def _get_file_lock(self, file_path: Path) -> asyncio.Lock:
         """Get or create a lock for the given file path.
 
@@ -603,9 +614,15 @@ class IndexingCoordinator(BaseService):
                     # NOTE: Transaction management is handled internally by the database provider
                     # to avoid transaction context issues during concurrent operations
                     try:
+                        # Use the (id, chunk) pairs stored by _store_parsed_results.
+                        # Zipping ids against ALL parsed chunks is wrong whenever
+                        # the smart diff kept unchanged chunks: the id list only
+                        # covers added+modified chunks, so the lists diverge and
+                        # embedding generation fails with a length mismatch.
+                        pairs = stats["chunks_for_embedding"]
                         embeddings_generated = await self._generate_embeddings(
-                            stats["chunk_ids_needing_embeddings"],
-                            [chunk for r in parsed_results for chunk in r.chunks],
+                            [chunk_id for chunk_id, _ in pairs],
+                            [chunk_dict for _, chunk_dict in pairs],
                         )
 
                         # Verify embeddings were actually generated
@@ -814,30 +831,75 @@ class IndexingCoordinator(BaseService):
                 for batch in file_batches
             ]
 
-            # Consume results as they complete to stream progress
-            all_results: list[ParsedFileResult] = []
             completed_files = 0
-            for fut in asyncio.as_completed(futures):
-                batch_result = await fut
-                all_results.extend(batch_result)
-                # Update parse progress
+
+            def _advance_parse_progress(batch_result: list[ParsedFileResult]) -> None:
+                nonlocal completed_files
                 if parse_task is not None and self.progress:
                     inc = len(batch_result)
                     completed_files += inc
                     self.progress.advance(parse_task, inc)
                     self.progress.update(parse_task, info=f"{completed_files} parsed")
-                # Stream results to storage if callback provided
-                if on_batch is not None:
-                    try:
-                        if asyncio.iscoroutinefunction(on_batch):
-                            await on_batch(batch_result)
-                        else:
-                            on_batch(batch_result)
-                    except Exception:
-                        # Re-raise all exceptions from on_batch to propagate disk limit errors
-                        raise
 
-        return all_results
+            if on_batch is None:
+                # Collect-and-return mode (single-file and test callers)
+                all_results: list[ParsedFileResult] = []
+                for fut in asyncio.as_completed(futures):
+                    batch_result = await fut
+                    all_results.extend(batch_result)
+                    _advance_parse_progress(batch_result)
+                return all_results
+
+            # Streaming mode: hand parsed batches to on_batch through a
+            # bounded queue serviced by a dedicated consumer task. Collecting
+            # parse results never waits for storage (the previous code
+            # awaited on_batch inline, stalling result collection during
+            # every store), while the bounded queue caps how much parsed
+            # output can pile up in memory. Results are NOT accumulated here
+            # — retaining every chunk of a large corpus alongside streaming
+            # was pure memory overhead.
+            queue: asyncio.Queue[list[ParsedFileResult] | None] = asyncio.Queue(
+                maxsize=2
+            )
+
+            async def _consume() -> None:
+                while True:
+                    batch = await queue.get()
+                    if batch is None:
+                        return
+                    if asyncio.iscoroutinefunction(on_batch):
+                        await on_batch(batch)
+                    else:
+                        on_batch(batch)
+
+            consumer = asyncio.create_task(_consume())
+            try:
+                for fut in asyncio.as_completed(futures):
+                    batch_result = await fut
+                    _advance_parse_progress(batch_result)
+                    put_task = asyncio.ensure_future(queue.put(batch_result))
+                    done, _ = await asyncio.wait(
+                        {put_task, consumer}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if consumer in done:
+                        # Consumer only finishes early by raising (e.g. disk
+                        # limit exceeded) — propagate instead of deadlocking
+                        # on a queue nobody drains.
+                        put_task.cancel()
+                        consumer.result()
+                        raise RuntimeError("store consumer exited prematurely")
+                    await put_task
+                await queue.put(None)
+                await consumer
+            except BaseException:
+                consumer.cancel()
+                try:
+                    await consumer
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
+
+        return []
 
     def _check_disk_usage_limit(self) -> DiskUsageLimitExceededError | None:
         """Check if database size exceeds configured limit.
@@ -974,12 +1036,16 @@ class IndexingCoordinator(BaseService):
         results: list[ParsedFileResult],
         file_task: TaskID | None = None,
         cumulative_counters: dict[str, int] | None = None,
+        known_new_paths: set[str] | None = None,
     ) -> dict[str, Any]:
         """Store all parsed results in database (single-threaded).
 
         Args:
             results: List of parsed file results from batch processing
             file_task: Optional progress task ID for tracking
+            known_new_paths: Relative posix paths that the change-detection
+                pre-scan proved absent from the DB. For these files the
+                per-file existence SELECTs are skipped entirely.
 
         Returns:
             Dictionary with processing statistics. For single-file callers,
@@ -990,6 +1056,10 @@ class IndexingCoordinator(BaseService):
             "total_chunks": 0,
             "errors": [],
             "chunk_ids_needing_embeddings": [],
+            # (chunk_id, chunk_dict) pairs aligned by construction — the
+            # embedding path must never re-derive this pairing by zipping
+            # separate lists of different lengths.
+            "chunks_for_embedding": [],
         }
 
         # Check disk usage limit before storing data
@@ -1011,27 +1081,16 @@ class IndexingCoordinator(BaseService):
         # Track file_ids for single-file case
         file_ids: list[int] = []
 
-        # Process each file independently (per-file transaction)
+        storable: list[ParsedFileResult] = []
         for result in results:
             # Handle errors
             if result.status == "error":
                 stats["errors"].append(
                     {"file": str(result.file_path), "error": result.error}
                 )
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["errors"] = (
-                            cumulative_counters.get("errors", 0) + 1
-                        )
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        chunks_so_far = cumulative_counters.get("chunks", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, chunks_so_far),
-                        )
+                self._advance_store_progress(
+                    file_task, cumulative_counters, "errors", stats
+                )
                 continue
 
             # Handle skipped files
@@ -1061,131 +1120,46 @@ class IndexingCoordinator(BaseService):
                         "Failed to record skipped file in DB; next run will re-evaluate",
                         exc_info=True,
                     )
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["skipped"] = (
-                            cumulative_counters.get("skipped", 0) + 1
-                        )
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        chunks_so_far = cumulative_counters.get("chunks", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, chunks_so_far),
-                        )
-                continue
-
-            # Detect language for storage
-            language = result.language
-
-            # Per-file transaction boundaries
-            try:
-                await self._db.begin_transaction_async()
-                # Create stat object for _store_file_record
-                file_stat = _StatResult(result.file_size, result.file_mtime)
-                # Extract content hash if available (from parsing result or precomputed)
-                content_hash = getattr(result, "content_hash", None)
-                file_id, is_existing = await self._store_file_record(
-                    result.file_path, file_stat, language, content_hash
+                self._advance_store_progress(
+                    file_task, cumulative_counters, "skipped", stats
                 )
-
-                # Track file_id for single-file case
-                file_ids.append(file_id)
-
-                # Convert result chunks to Chunk models using from_dict()
-                new_chunk_models = [
-                    Chunk.from_dict({**chunk_data, "file_id": file_id})
-                    for chunk_data in result.chunks
-                ]
-
-                existing_chunks: list[Chunk]
-                if is_existing:
-                    existing_chunks = cast(
-                        list[Chunk],
-                        await self._db.get_chunks_by_file_id_async(
-                            file_id, as_model=True
-                        ),
-                    )
-                else:
-                    existing_chunks = []
-
-                if existing_chunks:
-                    # Smart diff to preserve embeddings
-                    chunk_diff = self._chunk_cache.diff_chunks(
-                        new_chunk_models, existing_chunks
-                    )
-
-                    # Delete modified/removed chunks
-                    chunks_to_delete = chunk_diff.deleted + chunk_diff.modified
-                    if chunks_to_delete:
-                        chunk_ids_to_delete = [
-                            int(chunk.id)
-                            for chunk in chunks_to_delete
-                            if chunk.id is not None
-                        ]
-                        if chunk_ids_to_delete:
-                            await self._db.delete_chunks_batch_async(
-                                chunk_ids_to_delete
-                            )
-
-                    # Store new/modified chunks (pass models directly)
-                    chunks_to_store = chunk_diff.added + chunk_diff.modified
-                    chunks_to_store = self._validate_chunk_sizes(chunks_to_store)
-                    ids = (
-                        await self._db.insert_chunks_batch_async(chunks_to_store)
-                        if chunks_to_store
-                        else []
-                    )
-                else:
-                    # New file or existing file with no chunks — store all
-                    new_chunk_models = self._validate_chunk_sizes(new_chunk_models)
-                    ids = await self._db.insert_chunks_batch_async(new_chunk_models)
-                logger.debug(f"Batch inserted {len(ids)} chunks for file_id {file_id}")
-                stats["chunk_ids_needing_embeddings"].extend(ids)
-                stats["total_chunks"] += len(ids)
-                # Count this file as processed successfully (stored or updated)
-                stats["total_files"] += 1
-
-                # Commit per-file; threshold-based checkpointing manages WAL compaction
-                await self._db.commit_transaction_async(force_checkpoint=False)
-
-                # Update progress
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["stored"] = (
-                            cumulative_counters.get("stored", 0) + 1
-                        )
-                        base = int(cumulative_counters.get("chunks", 0))
-                        display_chunks = base + stats["total_chunks"]
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, display_chunks),
-                        )
-
-            except Exception as e:
-                await self._db.rollback_transaction_async()
-                stats["errors"].append({"file": str(result.file_path), "error": str(e)})
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["errors"] = (
-                            cumulative_counters.get("errors", 0) + 1
-                        )
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        chunks_so_far = cumulative_counters.get("chunks", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, chunks_so_far),
-                        )
                 continue
+
+            storable.append(result)
+
+        # Store all parseable files: one transaction + batched statements per
+        # call when the provider supports it, falling back to the per-file
+        # path (its own transaction per file) on any batch failure so a
+        # single pathological file cannot poison its whole batch.
+        if storable:
+            batched = False
+            if len(storable) > 1 and callable(
+                getattr(self._db, "prepare_files_batch_async", None)
+            ):
+                try:
+                    await self._store_results_batched(
+                        storable, stats, file_ids, file_task, cumulative_counters
+                    )
+                    batched = True
+                except Exception as e:
+                    logger.warning(
+                        f"Batched store of {len(storable)} files failed; "
+                        f"retrying per-file: {e}"
+                    )
+                    try:
+                        await self._db.rollback_transaction_async()
+                    except Exception:
+                        pass
+            if not batched:
+                for result in storable:
+                    await self._store_single_parsed_result(
+                        result,
+                        stats,
+                        file_ids,
+                        file_task,
+                        cumulative_counters,
+                        known_new_paths,
+                    )
 
         # Update external cumulative counters
         if cumulative_counters is not None:
@@ -1200,6 +1174,218 @@ class IndexingCoordinator(BaseService):
         if len(results) == 1 and file_ids and file_ids[0] is not None:
             stats["file_id"] = file_ids[0]
         return stats
+
+    def _advance_store_progress(
+        self,
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+        kind: str,
+        stats: dict[str, Any],
+    ) -> None:
+        """Advance the store progress bar by one file of the given kind."""
+        if file_task is None or not self.progress:
+            return
+        self.progress.advance(file_task, 1)
+        if cumulative_counters is None:
+            return
+        cumulative_counters[kind] = cumulative_counters.get(kind, 0) + 1
+        stored = cumulative_counters.get("stored", 0)
+        skipped = cumulative_counters.get("skipped", 0)
+        errs = cumulative_counters.get("errors", 0)
+        display_chunks = cumulative_counters.get("chunks", 0)
+        if kind == "stored":
+            # Chunks stored in this call are folded into the external counter
+            # only after the call completes; show them live meanwhile.
+            display_chunks += stats["total_chunks"]
+        self.progress.update(
+            file_task,
+            info=_progress_info(stored, skipped, errs, display_chunks),
+        )
+
+    def _diff_and_validate_chunks(
+        self,
+        result: ParsedFileResult,
+        file_id: int,
+        existing_chunks: list[Chunk],
+    ) -> tuple[list[int], list[Chunk]]:
+        """Compute (chunk ids to delete, validated chunk models to insert)."""
+        new_chunk_models = [
+            Chunk.from_dict({**chunk_data, "file_id": file_id})
+            for chunk_data in result.chunks
+        ]
+        if not existing_chunks:
+            return [], self._validate_chunk_sizes(new_chunk_models)
+
+        # Smart diff to preserve embeddings
+        chunk_diff = self._chunk_cache.diff_chunks(new_chunk_models, existing_chunks)
+        ids_to_delete = [
+            int(chunk.id)
+            for chunk in chunk_diff.deleted + chunk_diff.modified
+            if chunk.id is not None
+        ]
+        chunks_to_store = self._validate_chunk_sizes(
+            chunk_diff.added + chunk_diff.modified
+        )
+        return ids_to_delete, chunks_to_store
+
+    async def _store_results_batched(
+        self,
+        storable: list[ParsedFileResult],
+        stats: dict[str, Any],
+        file_ids: list[int],
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+    ) -> None:
+        """Store a whole parsed batch in one transaction with batched statements.
+
+        Executor dispatches per batch: begin + prepare_files_batch +
+        [delete_chunks_batch] + insert_chunks_batch + commit — instead of
+        5-7 dispatches per file.
+        """
+        file_models = [
+            File(
+                path=FilePath(self._get_relative_path(r.file_path).as_posix()),
+                size_bytes=r.file_size,
+                mtime=Timestamp(r.file_mtime),
+                language=r.language,
+                content_hash=getattr(r, "content_hash", None),
+            )
+            for r in storable
+        ]
+        prepare_files_batch = self._db.prepare_files_batch_async  # type: ignore[attr-defined]
+
+        async with self._get_db_txn_lock():
+            await self._db.begin_transaction_async()
+            try:
+                prepared = await prepare_files_batch(file_models)
+
+                all_delete_ids: list[int] = []
+                all_insert_models: list[Chunk] = []
+                per_file_counts: list[int] = []
+                for result, (file_id, _is_existing, existing_chunks) in zip(
+                    storable, prepared
+                ):
+                    ids_to_delete, chunks_to_store = self._diff_and_validate_chunks(
+                        result, file_id, existing_chunks
+                    )
+                    all_delete_ids.extend(ids_to_delete)
+                    all_insert_models.extend(chunks_to_store)
+                    per_file_counts.append(len(chunks_to_store))
+
+                if all_delete_ids:
+                    await self._db.delete_chunks_batch_async(all_delete_ids)
+                inserted_ids: list[int] = (
+                    await self._db.insert_chunks_batch_async(all_insert_models)
+                    if all_insert_models
+                    else []
+                )
+                await self._db.commit_transaction_async(force_checkpoint=False)
+            except Exception:
+                await self._db.rollback_transaction_async()
+                raise
+
+        stats["chunk_ids_needing_embeddings"].extend(inserted_ids)
+        for chunk_id, model in zip(inserted_ids, all_insert_models):
+            stats["chunks_for_embedding"].append((chunk_id, model.to_dict()))
+        logger.debug(
+            f"Batch stored {len(storable)} files / {len(inserted_ids)} chunks "
+            f"in one transaction"
+        )
+        for (file_id, _is_existing, _existing), count in zip(prepared, per_file_counts):
+            file_ids.append(file_id)
+            stats["total_chunks"] += count
+            stats["total_files"] += 1
+            self._advance_store_progress(
+                file_task, cumulative_counters, "stored", stats
+            )
+
+    async def _store_single_parsed_result(
+        self,
+        result: ParsedFileResult,
+        stats: dict[str, Any],
+        file_ids: list[int],
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+        known_new_paths: set[str] | None,
+    ) -> None:
+        """Store one parsed file in its own transaction (legacy per-file path)."""
+        async with self._get_db_txn_lock():
+            await self._store_single_parsed_result_locked(
+                result, stats, file_ids, file_task, cumulative_counters, known_new_paths
+            )
+
+    async def _store_single_parsed_result_locked(
+        self,
+        result: ParsedFileResult,
+        stats: dict[str, Any],
+        file_ids: list[int],
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+        known_new_paths: set[str] | None,
+    ) -> None:
+        """Body of _store_single_parsed_result; caller holds the DB txn lock."""
+        try:
+            await self._db.begin_transaction_async()
+            # Create stat object for _store_file_record
+            file_stat = _StatResult(result.file_size, result.file_mtime)
+            # Extract content hash if available (from parsing result or precomputed)
+            content_hash = getattr(result, "content_hash", None)
+            assume_new = (
+                known_new_paths is not None
+                and self._get_relative_path(result.file_path).as_posix()
+                in known_new_paths
+            )
+            file_id, is_existing = await self._store_file_record(
+                result.file_path,
+                file_stat,
+                result.language,
+                content_hash,
+                assume_new=assume_new,
+            )
+
+            # Track file_id for single-file case
+            file_ids.append(file_id)
+
+            existing_chunks: list[Chunk]
+            if is_existing:
+                existing_chunks = cast(
+                    list[Chunk],
+                    await self._db.get_chunks_by_file_id_async(file_id, as_model=True),
+                )
+            else:
+                existing_chunks = []
+
+            ids_to_delete, chunks_to_store = self._diff_and_validate_chunks(
+                result, file_id, existing_chunks
+            )
+            if ids_to_delete:
+                await self._db.delete_chunks_batch_async(ids_to_delete)
+            ids = (
+                await self._db.insert_chunks_batch_async(chunks_to_store)
+                if chunks_to_store
+                else []
+            )
+            logger.debug(f"Batch inserted {len(ids)} chunks for file_id {file_id}")
+            stats["chunk_ids_needing_embeddings"].extend(ids)
+            for chunk_id, model in zip(ids, chunks_to_store):
+                stats["chunks_for_embedding"].append((chunk_id, model.to_dict()))
+            stats["total_chunks"] += len(ids)
+            # Count this file as processed successfully (stored or updated)
+            stats["total_files"] += 1
+
+            # Commit per-file; threshold-based checkpointing manages WAL compaction
+            await self._db.commit_transaction_async(force_checkpoint=False)
+
+            self._advance_store_progress(
+                file_task, cumulative_counters, "stored", stats
+            )
+
+        except Exception as e:
+            await self._db.rollback_transaction_async()
+            stats["errors"].append({"file": str(result.file_path), "error": str(e)})
+            self._advance_store_progress(
+                file_task, cumulative_counters, "errors", stats
+            )
 
     async def process_directory(
         self,
@@ -1277,7 +1463,12 @@ class IndexingCoordinator(BaseService):
 
             files_to_process: list[Path] | list[tuple[Path, str | None]] = list(files)
             skipped_unchanged = 0
+            # Relative paths proven absent from the DB by the pre-scan below.
+            # Lets the store path skip per-file existence SELECTs (None when
+            # no pre-scan ran, e.g. force_reindex).
+            known_new_paths: set[str] | None = None
             if not force_reindex:
+                known_new_paths = set()
                 _t4 = _t.perf_counter() if _t0 is not None else None
                 change_task: TaskID | None = None
                 if self.progress:
@@ -1422,6 +1613,7 @@ class IndexingCoordinator(BaseService):
                             cur_hash = self._compute_hash_with_fallback(f)
                             precomputed_hashes[str(f.resolve())] = cur_hash
                             files_to_process_with_hashes.append((f, cur_hash))
+                            known_new_paths.add(rel)
                             if cur_hash is None:
                                 reasons["error"] += 1
                             else:
@@ -1476,6 +1668,80 @@ class IndexingCoordinator(BaseService):
                 "errors": 0,
             }
 
+            # Streamed embedding: start embedding a batch's chunks as soon as
+            # that batch is committed instead of waiting for 100% of storage.
+            # The final generate_missing_embeddings sweep still runs and
+            # remains the completeness guarantee — streamed failures degrade
+            # to sweep work, never to lost embeddings.
+            # CHUNKHOUND_STREAM_EMBEDDINGS=0 restores the sweep-only flow.
+            stream_embeddings = (
+                self._embedding_provider is not None
+                and os.environ.get("CHUNKHOUND_STREAM_EMBEDDINGS", "1") != "0"
+            )
+            embed_tasks: list[asyncio.Task[int]] = []
+            # Match the sweep's parallelism so streaming never embeds with
+            # less concurrency than the sequential flow it replaces.
+            embed_concurrency = 8
+            stream_task_chunks = 300
+            if stream_embeddings and self._embedding_provider is not None:
+                get_conc = getattr(
+                    self._embedding_provider, "get_recommended_concurrency", None
+                )
+                if callable(get_conc):
+                    try:
+                        embed_concurrency = max(1, int(get_conc()))
+                    except Exception:
+                        pass
+                provider_batch = getattr(self._embedding_provider, "batch_size", None)
+                if isinstance(provider_batch, int) and provider_batch > 0:
+                    # One provider request per task keeps tasks from
+                    # serializing internally behind embed_batch's own split.
+                    stream_task_chunks = provider_batch
+            embed_semaphore = asyncio.Semaphore(embed_concurrency)
+
+            async def _embed_pairs(pairs: list[tuple[int, dict[str, Any]]]) -> int:
+                # Embed EXACTLY the text the missing-embeddings sweep would
+                # embed (raw stored chunk code) so streamed and swept chunks
+                # get identical vectors and search results stay byte-for-byte
+                # comparable with the sequential flow.
+                # NOTE: process_file (realtime) instead embeds
+                # format_chunk_for_embedding(...) output — a pre-existing
+                # formatting inconsistency between the two embed paths that is
+                # deliberately NOT resolved here.
+                provider = self._embedding_provider
+                if provider is None:
+                    return 0
+                async with embed_semaphore:
+                    try:
+                        valid = [
+                            (chunk_id, chunk_dict.get("code") or "")
+                            for chunk_id, chunk_dict in pairs
+                        ]
+                        valid = [(cid, text) for cid, text in valid if text.strip()]
+                        if not valid:
+                            return 0
+                        vectors = await provider.embed_batch(
+                            [text for _, text in valid]
+                        )
+                        embeddings_data = [
+                            {
+                                "chunk_id": chunk_id,
+                                "provider": provider.name,
+                                "model": provider.model,
+                                "dims": len(vector),
+                                "embedding": vector,
+                            }
+                            for (chunk_id, _), vector in zip(valid, vectors)
+                        ]
+                        return await self._insert_embeddings_locked(
+                            embeddings_data, None
+                        )
+                    except Exception as e:
+                        # Leftovers are picked up by the missing-embeddings
+                        # sweep after storage completes.
+                        logger.warning(f"Streamed embedding batch failed: {e}")
+                        return 0
+
             async def _on_batch_store(batch: list[ParsedFileResult]) -> None:
                 nonlocal \
                     agg_total_files, \
@@ -1493,7 +1759,10 @@ class IndexingCoordinator(BaseService):
 
                 # Store this batch immediately
                 stats_part = await self._store_parsed_results(
-                    batch, store_task, cumulative_counters=store_progress_counters
+                    batch,
+                    store_task,
+                    cumulative_counters=store_progress_counters,
+                    known_new_paths=known_new_paths,
                 )
 
                 agg_total_files += stats_part.get("total_files", 0)
@@ -1501,15 +1770,43 @@ class IndexingCoordinator(BaseService):
                 agg_errors.extend(stats_part.get("errors", []))
                 agg_skipped_paths.extend(stats_part.get("skipped_paths", []))
 
+                if stream_embeddings:
+                    pairs = stats_part.get("chunks_for_embedding") or []
+                    for start in range(0, len(pairs), stream_task_chunks):
+                        embed_tasks.append(
+                            asyncio.create_task(
+                                _embed_pairs(pairs[start : start + stream_task_chunks])
+                            )
+                        )
+
             # Parse files (streaming progress as batches complete and store concurrently)
             # Pass files_to_process directly - preserves hash for each file
             # Results flow to storage via on_batch=_on_batch_store; return value unused.
-            await self._process_files_in_batches(
-                files_to_process,
-                config_file_size_threshold_kb,
-                parse_task,
-                on_batch=_on_batch_store,
-            )
+            try:
+                await self._process_files_in_batches(
+                    files_to_process,
+                    config_file_size_threshold_kb,
+                    parse_task,
+                    on_batch=_on_batch_store,
+                )
+            except BaseException:
+                for embed_task in embed_tasks:
+                    embed_task.cancel()
+                raise
+
+            # Drain streamed embedding work before reporting/compaction.
+            streamed_embeddings = 0
+            if embed_tasks:
+                embed_results = await asyncio.gather(
+                    *embed_tasks, return_exceptions=True
+                )
+                streamed_embeddings = sum(
+                    r for r in embed_results if isinstance(r, int)
+                )
+                logger.debug(
+                    f"Streamed {streamed_embeddings} embeddings across "
+                    f"{len(embed_tasks)} tasks during storage"
+                )
 
             # Mark parse task complete
             if parse_task is not None and self.progress:
@@ -1617,6 +1914,7 @@ class IndexingCoordinator(BaseService):
                 "skipped_due_to_timeout": skipped_due_to_timeout,
                 "skipped_unchanged": skipped_unchanged,
                 "skipped_filtered": skipped_filtered,
+                "streamed_embeddings": streamed_embeddings,
             }
 
         except Exception as e:
@@ -1666,6 +1964,7 @@ class IndexingCoordinator(BaseService):
         file_stat: Any,
         language: Language,
         content_hash: str | None = None,
+        assume_new: bool = False,
     ) -> tuple[int, bool]:
         """Store or update file record in database.
 
@@ -1679,26 +1978,34 @@ class IndexingCoordinator(BaseService):
             file_stat: File stat object with st_size and st_mtime
             language: Programming language of the file
             content_hash: Optional content hash for change detection
+            assume_new: Caller has already proven the file is absent from the
+                DB (change-detection pre-scan), so the existence SELECT can be
+                skipped when the provider supports it. Providers keep a
+                duplicate-key fallback, so a stale assumption degrades to the
+                legacy update path instead of corrupting data.
 
         Returns:
             Tuple of (file_id, is_existing) where is_existing indicates
             whether the file already existed in the database.
         """
         relative_path = self._get_relative_path(file_path)
-        existing_file = cast(
-            dict[str, Any] | None,
-            await self._db.get_file_by_path_async(relative_path.as_posix()),
-        )
 
-        if existing_file:
-            file_id = existing_file["id"]
-            await self._db.update_file_async(
-                file_id,
-                size_bytes=file_stat.st_size,
-                mtime=file_stat.st_mtime,
-                content_hash=content_hash,
+        insert_assume_new = getattr(self._db, "insert_file_assume_new_async", None)
+        if not (assume_new and callable(insert_assume_new)):
+            existing_file = cast(
+                dict[str, Any] | None,
+                await self._db.get_file_by_path_async(relative_path.as_posix()),
             )
-            return file_id, True
+
+            if existing_file:
+                file_id = existing_file["id"]
+                await self._db.update_file_async(
+                    file_id,
+                    size_bytes=file_stat.st_size,
+                    mtime=file_stat.st_mtime,
+                    content_hash=content_hash,
+                )
+                return file_id, True
 
         file_model = File(
             path=FilePath(relative_path.as_posix()),
@@ -1707,6 +2014,12 @@ class IndexingCoordinator(BaseService):
             language=language,
             content_hash=content_hash,
         )
+        if assume_new and callable(insert_assume_new):
+            file_id, inserted = await insert_assume_new(file_model)
+            # inserted=False means the assumption was stale (e.g. a concurrent
+            # realtime update stored the file first) — report is_existing=True
+            # so the caller runs its chunk diff instead of double-inserting.
+            return file_id, not inserted
         return await self._db.insert_file_async(file_model), False
 
     async def get_stats(self) -> dict[str, Any]:
@@ -1960,8 +2273,8 @@ class IndexingCoordinator(BaseService):
             # from a previous operation. Try insertion, and if we get a transaction error,
             # clean up and retry once.
             try:
-                result = self._db.insert_embeddings_batch(
-                    embeddings_data, connection=connection
+                result = await self._insert_embeddings_locked(
+                    embeddings_data, connection
                 )
                 return result
             except Exception as e:
@@ -1977,8 +2290,8 @@ class IndexingCoordinator(BaseService):
                         pass  # Ignore errors during cleanup
 
                     # Retry the insertion with a fresh transaction
-                    result = self._db.insert_embeddings_batch(
-                        embeddings_data, connection=connection
+                    result = await self._insert_embeddings_locked(
+                        embeddings_data, connection
                     )
                     logger.info(
                         f"[IndexCoord] Successfully inserted {result} embeddings after "
@@ -1997,6 +2310,25 @@ class IndexingCoordinator(BaseService):
                 f"[IndexCoord] Failed to generate embeddings (chunks: {len(text_sizes)}, max_chars: {max_chars}): {e}"
             )
             return 0
+
+    async def _insert_embeddings_locked(
+        self, embeddings_data: list[dict[str, Any]], connection: Any
+    ) -> int:
+        """Insert embeddings under the DB txn lock.
+
+        The lock keeps the insert from being dispatched into the middle of a
+        concurrently running multi-dispatch store transaction (streamed
+        embedding mode). Uses the provider's async insert when available so
+        the event loop is not blocked for the duration of the upsert.
+        """
+        insert_async = getattr(self._db, "insert_embeddings_batch_async", None)
+        async with self._get_db_txn_lock():
+            if callable(insert_async):
+                inserted: int = await insert_async(embeddings_data)
+                return inserted
+            return self._db.insert_embeddings_batch(
+                embeddings_data, connection=connection
+            )
 
     async def _generate_embeddings_batch(
         self, file_chunks: list[tuple[int, dict[str, Any]]]

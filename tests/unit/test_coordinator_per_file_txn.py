@@ -54,15 +54,17 @@ def _run_test(db: DuckDBProvider, tmp_path: Path) -> None:
         }
     ]
 
-    # Monkeypatch _store_file_record to fail for bad_file
-    original_store = coord._store_file_record
+    # Inject a per-file failure at a point shared by BOTH store paths (the
+    # batched path and its per-file fallback): batch storage must roll back
+    # and the per-file retry must then isolate the failure to bad_file.
+    original_diff = coord._diff_and_validate_chunks
 
-    async def _failing_store(path, *args, **kwargs):
-        if Path(path) == bad_file:
+    def _failing_diff(result, file_id, existing_chunks):
+        if Path(result.file_path) == bad_file:
             raise RuntimeError("boom")
-        return await original_store(path, *args, **kwargs)
+        return original_diff(result, file_id, existing_chunks)
 
-    coord._store_file_record = _failing_store  # type: ignore[assignment]
+    coord._diff_and_validate_chunks = _failing_diff  # type: ignore[assignment]
 
     results = [
         _pfr(good_file, good_chunks, ok=True),

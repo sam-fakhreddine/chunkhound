@@ -106,10 +106,14 @@ class DirectoryIndexingService:
                 await self._run_batch_compaction(stats)
 
             # Embedding generation (extracted from run.py:85-88, 287-312)
+            # Most embeddings are streamed during storage now; the sweep
+            # remains the completeness guarantee for leftovers/failures.
             if not no_embeddings:
                 self.progress_callback("Checking for missing embeddings...")
                 embed_result = await self._generate_missing_embeddings(exclude_patterns)
-                stats.embeddings_generated = embed_result.get("generated", 0)
+                stats.embeddings_generated = process_result.get(
+                    "streamed_embeddings", 0
+                ) + embed_result.get("generated", 0)
 
             # Second compaction boundary: needed when embeddings were
             # generated, or when files were processed (but the first

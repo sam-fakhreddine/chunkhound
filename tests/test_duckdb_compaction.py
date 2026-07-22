@@ -296,6 +296,12 @@ def populated_db(
         ]
         db._execute_in_db_thread_sync("insert_embeddings_batch", emb_data, None)
 
+    # Materialize the seeded data into the main DB file. Embedding inserts no
+    # longer force a checkpoint (bulk-write fix), so without this the data
+    # would sit in the WAL and file-size/fragmentation assertions downstream
+    # would measure an almost-empty main file.
+    db._execute_in_db_thread_sync("maybe_checkpoint", True)
+
     return db
 
 

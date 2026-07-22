@@ -278,6 +278,12 @@ class DuckDBProvider(SerialDatabaseProvider):
             }
         }
 
+        # While True (between drop_all_hnsw_indexes and
+        # ensure_all_hnsw_indexes), newly created embedding tables defer their
+        # HNSW index to the ensure step. Only touched from the executor thread
+        # after connect; initialized here for a defined default.
+        self._hnsw_bulk_defer = False
+
     def _create_connection(self) -> Any:
         """Create and return a DuckDB connection.
 
@@ -1008,7 +1014,17 @@ class DuckDBProvider(SerialDatabaseProvider):
         if not self._executor_table_exists(conn, state, table_name):
             logger.info(f"Creating embedding table for {dims} dimensions: {table_name}")
             conn.execute(_create_embedding_table_sql(dims))
-            self._executor_create_embedding_table_indexes(conn, state, table_name, dims)
+            # During a bulk run (drop_all_hnsw_indexes .. ensure_all_hnsw_indexes)
+            # the HNSW index is deferred to the ensure step; creating it here
+            # would put index maintenance + per-checkpoint re-serialization
+            # back into every bulk embedding insert.
+            self._executor_create_embedding_table_indexes(
+                conn,
+                state,
+                table_name,
+                dims,
+                create_hnsw=not getattr(self, "_hnsw_bulk_defer", False),
+            )
             return table_name
 
         self._executor_reseed_sequence(conn, table_name, "embeddings_id_seq")
@@ -2294,7 +2310,21 @@ class DuckDBProvider(SerialDatabaseProvider):
         so custom-named HNSW indexes are properly dropped.  Previously the name-pattern
         filter (``LIKE 'hnsw_%'``) missed indexes like ``alt_live_idx`` that use
         ``USING HNSW``.
+
+        Also enters HNSW-deferred bulk mode: embedding tables created while it
+        is active (the cold-index case, where no table exists yet when indexes
+        are dropped) are created WITHOUT their HNSW index, so bulk inserts and
+        checkpoints never carry index maintenance. VSS re-serializes the whole
+        index into the DB file on every checkpoint, so a live index during a
+        bulk load makes file growth quadratic in batch count — measured 27 GB
+        for ~700 MB of vectors before this change.
+        ``_executor_ensure_all_hnsw_indexes`` exits the mode and builds the
+        indexes once. If a bulk run dies before that, semantic search on new
+        tables falls back to a sequential scan (correct, slower) until the
+        next completed run rebuilds — the same recovery story as a crash
+        between the existing drop/ensure pair.
         """
+        self._hnsw_bulk_defer = True
         indexes = self._executor_get_existing_vector_indexes(conn, state)
         dropped = 0
         for idx in indexes:
@@ -2310,6 +2340,9 @@ class DuckDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any]
     ) -> None:
         """Create canonical HNSW indexes on all embedding tables that have data."""
+        # Exit bulk mode first so tables created after this point get their
+        # HNSW index at creation time again (realtime behavior).
+        self._hnsw_bulk_defer = False
         tables = conn.execute(
             "SELECT table_name FROM information_schema.tables "
             f"WHERE {_embedding_tables_where_clause()}"
@@ -2802,6 +2835,221 @@ class DuckDBProvider(SerialDatabaseProvider):
         """Insert file record and return file ID - delegate to file repository."""
         return self._execute_in_db_thread_sync("insert_file", file)
 
+    async def insert_file_assume_new_async(self, file: File) -> tuple[int, bool]:
+        """Insert a file record the caller proved absent from the DB.
+
+        Skips the pre-insert existence SELECT (the caller's change-detection
+        pre-scan already answered it). Returns (file_id, inserted). A stale
+        assumption is safe: the UNIQUE(path) violation falls back to the
+        legacy update path and reports inserted=False so callers apply their
+        existing-file chunk diff.
+        """
+        return cast(
+            tuple[int, bool],
+            await self._execute_in_db_thread("insert_file_assume_new", file),
+        )
+
+    def _executor_insert_file_assume_new(
+        self, conn: Any, state: dict[str, Any], file: File
+    ) -> tuple[int, bool]:
+        """Executor method for insert_file_assume_new - runs in DB thread."""
+        try:
+            return self._executor_insert_file_row(conn, file), True
+        except Exception as e:
+            if "Duplicate key" in str(e) and "violates unique constraint" in str(e):
+                existing = self._executor_get_file_by_path(
+                    conn, state, str(file.path), False
+                )
+                if isinstance(existing, dict) and "id" in existing:
+                    logger.info(
+                        f"File assumed new already exists, updating: {file.path}"
+                    )
+                    self._executor_update_file(
+                        conn,
+                        state,
+                        existing["id"],
+                        file.size_bytes if hasattr(file, "size_bytes") else None,
+                        file.mtime if hasattr(file, "mtime") else None,
+                        getattr(file, "content_hash", None),
+                    )
+                    return existing["id"], False
+            raise
+
+    async def prepare_files_batch_async(
+        self, files: list[File]
+    ) -> list[tuple[int, bool, list[Chunk]]]:
+        """Upsert many file rows and fetch their existing chunks in ONE dispatch.
+
+        Replaces, for a batch of N files, the per-file sequence of
+        get_file_by_path + insert/update + get_chunks_by_file_id executor
+        round-trips (3N dispatches) with a single dispatch running 4 batched
+        statements. Returns one (file_id, is_existing, existing_chunks) tuple
+        per input file, aligned with input order. existing_chunks is [] for
+        new files; callers diff it exactly as with get_chunks_by_file_id.
+        """
+        return cast(
+            list[tuple[int, bool, list[Chunk]]],
+            await self._execute_in_db_thread("prepare_files_batch", files),
+        )
+
+    def _executor_prepare_files_batch(
+        self, conn: Any, state: dict[str, Any], files: list[File]
+    ) -> list[tuple[int, bool, list[Chunk]]]:
+        """Executor method for prepare_files_batch - runs in DB thread."""
+        if not files:
+            return []
+
+        base_dir = state.get("base_directory")
+        lookup_paths = [normalize_path_for_lookup(str(f.path), base_dir) for f in files]
+        placeholders = ", ".join(["?"] * len(lookup_paths))
+        rows = conn.execute(
+            f"SELECT id, path FROM files WHERE path IN ({placeholders})",
+            lookup_paths,
+        ).fetchall()
+        existing_by_path = {row[1]: int(row[0]) for row in rows}
+
+        file_ids: list[int | None] = []
+        is_existing_flags: list[bool] = []
+        updates_with_hash: list[tuple[Any, ...]] = []
+        updates_without_hash: list[tuple[Any, ...]] = []
+        new_files: list[File] = []
+        for file, lookup_path in zip(files, lookup_paths):
+            file_id = existing_by_path.get(lookup_path)
+            if file_id is not None:
+                size = file.size_bytes if hasattr(file, "size_bytes") else None
+                mtime = file.mtime if hasattr(file, "mtime") else None
+                content_hash = getattr(file, "content_hash", None)
+                # Mirror _executor_update_file semantics: content_hash is only
+                # written when present; skip_reason is always cleared.
+                if content_hash is not None:
+                    updates_with_hash.append((size, mtime, content_hash, file_id))
+                else:
+                    updates_without_hash.append((size, mtime, file_id))
+                file_ids.append(file_id)
+                is_existing_flags.append(True)
+            else:
+                new_files.append(file)
+                file_ids.append(None)
+                is_existing_flags.append(False)
+
+        if updates_with_hash:
+            conn.executemany(
+                "UPDATE files SET size = ?, modified_time = to_timestamp(?), "
+                "content_hash = ?, skip_reason = NULL, updated_at = now() "
+                "WHERE id = ?",
+                updates_with_hash,
+            )
+        if updates_without_hash:
+            conn.executemany(
+                "UPDATE files SET size = ?, modified_time = to_timestamp(?), "
+                "skip_reason = NULL, updated_at = now() WHERE id = ?",
+                updates_without_hash,
+            )
+
+        if new_files:
+            # Explicit id allocation: executemany has no RETURNING, and id
+            # order must align with input regardless of insertion-order
+            # settings on this connection.
+            new_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    f"SELECT nextval('files_id_seq') FROM range({len(new_files)})"
+                ).fetchall()
+            ]
+            insert_rows = []
+            for new_id, file in zip(new_ids, new_files):
+                insert_rows.append(
+                    (
+                        new_id,
+                        str(file.path),
+                        file.name
+                        if hasattr(file, "name")
+                        else Path(str(file.path)).name,
+                        file.extension
+                        if hasattr(file, "extension")
+                        else Path(str(file.path)).suffix,
+                        file.size_bytes if hasattr(file, "size_bytes") else None,
+                        file.mtime if hasattr(file, "mtime") else None,
+                        getattr(file, "content_hash", None),
+                        file.language.value if file.language else None,
+                    )
+                )
+            conn.executemany(
+                "INSERT INTO files (id, path, name, extension, size, "
+                "modified_time, content_hash, language) "
+                "VALUES (?, ?, ?, ?, ?, to_timestamp(?), ?, ?)",
+                insert_rows,
+            )
+            new_id_iter = iter(new_ids)
+            file_ids = [
+                fid if fid is not None else next(new_id_iter) for fid in file_ids
+            ]
+
+        resolved_ids = cast(list[int], file_ids)
+
+        existing_ids = [
+            fid for fid, existing in zip(resolved_ids, is_existing_flags) if existing
+        ]
+        chunks_by_file: dict[int, list[Chunk]] = {}
+        if existing_ids:
+            id_placeholders = ", ".join(["?"] * len(existing_ids))
+            chunk_rows = conn.execute(
+                f"""
+                SELECT id, file_id, chunk_type, symbol, code, start_line, end_line,
+                       start_byte, end_byte, language, metadata
+                FROM chunks
+                WHERE file_id IN ({id_placeholders})
+                ORDER BY file_id, start_line, start_byte
+                """,
+                existing_ids,
+            ).fetchall()
+            for row in chunk_rows:
+                chunks_by_file.setdefault(int(row[1]), []).append(
+                    Chunk(
+                        id=row[0],
+                        file_id=row[1],
+                        chunk_type=ChunkType(row[2]),
+                        symbol=row[3],
+                        code=row[4],
+                        start_line=row[5],
+                        end_line=row[6],
+                        start_byte=row[7],
+                        end_byte=row[8],
+                        # Same shape as _executor_get_chunks_by_file_id: None
+                        # when unset, so batch-path diffs behave identically.
+                        language=Language(row[9]) if row[9] else None,  # type: ignore[arg-type]
+                        metadata=json.loads(row[10]) if row[10] else {},
+                    )
+                )
+
+        return [
+            (fid, existing, chunks_by_file.get(fid, []) if existing else [])
+            for fid, existing in zip(resolved_ids, is_existing_flags)
+        ]
+
+    def _executor_insert_file_row(self, conn: Any, file: File) -> int:
+        """INSERT one files row and return its id (no existence handling)."""
+        result = conn.execute(
+            """
+            INSERT INTO files
+                (path, name, extension, size, modified_time, content_hash, language)
+            VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?)
+            RETURNING id
+        """,
+            [
+                file.path,  # Store path as-is (now relative with forward slashes)
+                file.name if hasattr(file, "name") else Path(file.path).name,
+                file.extension
+                if hasattr(file, "extension")
+                else Path(file.path).suffix,
+                file.size_bytes if hasattr(file, "size_bytes") else None,
+                file.mtime if hasattr(file, "mtime") else None,
+                getattr(file, "content_hash", None),
+                file.language.value if file.language else None,
+            ],
+        )
+        return int(result.fetchone()[0])
+
     def _executor_insert_file(
         self, conn: Any, state: dict[str, Any], file: File
     ) -> int:
@@ -2824,28 +3072,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                 )
                 return file_id
 
-            # No existing file, insert new one
-            result = conn.execute(
-                """
-                INSERT INTO files (path, name, extension, size, modified_time, content_hash, language)
-                VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?)
-                RETURNING id
-            """,
-                [
-                    file.path,  # Store path as-is (now relative with forward slashes)
-                    file.name if hasattr(file, "name") else Path(file.path).name,
-                    file.extension
-                    if hasattr(file, "extension")
-                    else Path(file.path).suffix,
-                    file.size_bytes if hasattr(file, "size_bytes") else None,
-                    file.mtime if hasattr(file, "mtime") else None,
-                    getattr(file, "content_hash", None),
-                    file.language.value if file.language else None,
-                ],
-            )
-
-            file_id = result.fetchone()[0]
-            return file_id
+            return self._executor_insert_file_row(conn, file)
 
         except Exception as e:
             # Handle duplicate key errors
@@ -3156,15 +3383,31 @@ class DuckDBProvider(SerialDatabaseProvider):
     def _executor_insert_chunks_batch(
         self, conn: Any, state: dict[str, Any], chunks: list[Chunk]
     ) -> list[int]:
-        """Executor method for insert_chunks_batch - runs in DB thread."""
+        """Executor method for insert_chunks_batch - runs in DB thread.
+
+        Allocates chunk ids from the sequence up front and inserts them
+        explicitly. This keeps the returned id list aligned with the input
+        chunks by construction, instead of relying on RETURNING preserving
+        insertion order (which SET preserve_insertion_order = false — used by
+        bulk-optimized mutations on this connection — would silently break).
+        """
         if not chunks:
             return []
 
+        # Allocate ids first so the id<->chunk mapping is explicit.
+        chunk_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT nextval('chunks_id_seq') FROM range({len(chunks)})"
+            ).fetchall()
+        ]
+
         # Prepare data for bulk insert
         chunk_data = []
-        for chunk in chunks:
+        for chunk_id, chunk in zip(chunk_ids, chunks):
             chunk_data.append(
                 (
+                    chunk_id,
                     chunk.file_id,
                     chunk.chunk_type.value,
                     chunk.symbol or "",
@@ -3184,6 +3427,7 @@ class DuckDBProvider(SerialDatabaseProvider):
         _t0 = _t.perf_counter()
         conn.execute("""
             CREATE TEMPORARY TABLE IF NOT EXISTS temp_chunks (
+                id INTEGER,
                 file_id INTEGER,
                 chunk_type TEXT,
                 symbol TEXT,
@@ -3202,20 +3446,19 @@ class DuckDBProvider(SerialDatabaseProvider):
         # Bulk insert into temp table
         conn.executemany(
             """
-            INSERT INTO temp_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO temp_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             chunk_data,
         )
         _t2 = _t.perf_counter()
-        # Insert from temp to main table with RETURNING
-        result = conn.execute("""
-            INSERT INTO chunks (file_id, chunk_type, symbol, code, start_line, end_line,
-                              start_byte, end_byte, language, metadata)
+        # Insert from temp to main table (ids preallocated above)
+        conn.execute("""
+            INSERT INTO chunks (id, file_id, chunk_type, symbol, code,
+                              start_line, end_line, start_byte, end_byte,
+                              language, metadata)
             SELECT * FROM temp_chunks
-            RETURNING id
         """)
         _t3 = _t.perf_counter()
-        chunk_ids = [row[0] for row in result.fetchall()]
         # Reuse temp table across calls; do not drop here
 
         # Update metrics
@@ -3572,7 +3815,7 @@ class DuckDBProvider(SerialDatabaseProvider):
 
         try:
             # Group embeddings by dimension
-            embeddings_by_dims = {}
+            embeddings_by_dims: dict[int, list[dict[str, Any]]] = {}
             for emb_data in embeddings_data:
                 dims = emb_data["dims"]
                 if dims not in embeddings_by_dims:
@@ -3616,7 +3859,16 @@ class DuckDBProvider(SerialDatabaseProvider):
                     total_inserted += len(batch_data)
 
             if transaction_started:
-                self._executor_commit_transaction(conn, state, True)
+                # Plain COMMIT — durability comes from the WAL; DuckDB's
+                # auto-checkpoint (16MB WAL threshold) handles compaction.
+                # Forcing CHECKPOINT here made every embedding batch
+                # re-serialize any live HNSW index into the DB file: with N
+                # batches that is O(N^2) file growth (measured 27 GB for
+                # ~700 MB of vectors) and dominated embed-phase time.
+                # Committed embeddings are visible to same-connection queries
+                # and survive reopen via WAL replay — covered by the reopen
+                # guardrail test.
+                self._executor_commit_transaction(conn, state, False)
                 transaction_started = False
 
             return total_inserted
@@ -3624,6 +3876,54 @@ class DuckDBProvider(SerialDatabaseProvider):
             if transaction_started and state.get("transaction_active", False):
                 self._executor_rollback_transaction(conn, state)
             raise
+
+    async def insert_embeddings_batch_async(
+        self,
+        embeddings_data: list[dict],
+        batch_size: int | None = None,
+    ) -> int:
+        """Async variant of insert_embeddings_batch.
+
+        Lets embedding pipelines await the DB write instead of blocking the
+        event loop for the duration of an executemany upsert.
+        """
+        return cast(
+            int,
+            await self._execute_in_db_thread(
+                "insert_embeddings_batch", embeddings_data, batch_size
+            ),
+        )
+
+    def count_chunks_missing_embeddings(self, provider: str, model: str) -> int:
+        """Count chunks with no embedding for the given provider/model.
+
+        Cheap COUNT-only query so 'is there anything to embed?' does not
+        require loading every chunk (with code) into memory.
+        """
+        return cast(
+            int,
+            self._execute_in_db_thread_sync(
+                "count_chunks_missing_embeddings", provider, model
+            ),
+        )
+
+    def _executor_count_chunks_missing_embeddings(
+        self, conn: Any, state: dict[str, Any], provider: str, model: str
+    ) -> int:
+        """Executor method for count_chunks_missing_embeddings - runs in DB thread."""
+        embedding_tables = self._executor_get_all_embedding_tables(conn, state)
+        if not embedding_tables:
+            return int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        not_exists_clauses = [
+            f"NOT EXISTS (SELECT 1 FROM {table_name} e "
+            "WHERE e.chunk_id = c.id AND e.provider = ? AND e.model = ?)"
+            for table_name in embedding_tables
+        ]
+        query = "SELECT COUNT(*) FROM chunks c WHERE " + " AND ".join(
+            not_exists_clauses
+        )
+        params = [provider, model] * len(embedding_tables)
+        return int(conn.execute(query, params).fetchone()[0])
 
     def get_embedding_by_chunk_id(
         self, chunk_id: int, provider: str, model: str

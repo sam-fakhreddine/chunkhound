@@ -238,6 +238,24 @@ class EmbeddingService(BaseService):
             target_provider = provider_name or self._embedding_provider.name
             target_model = model_name or self._embedding_provider.model
 
+            # Cheap completeness probe: when the provider can COUNT missing
+            # chunks, a zero result short-circuits the scan below, which
+            # loads every chunk (including code) into memory twice. With
+            # streamed embedding during storage, zero-missing is the common
+            # case here. Only the ==0 outcome is acted on, so exclude
+            # patterns (which can only shrink the workload) stay correct.
+            count_missing = getattr(self._db, "count_chunks_missing_embeddings", None)
+            if callable(count_missing):
+                try:
+                    if count_missing(target_provider, target_model) == 0:
+                        return {
+                            "status": "complete",
+                            "generated": 0,
+                            "message": "All chunks have embeddings",
+                        }
+                except Exception as e:
+                    logger.debug(f"Missing-embedding count probe failed: {e}")
+
             # First, just get the count and IDs of chunks without embeddings (fast query)
             chunk_ids_without_embeddings = self._get_chunk_ids_without_embeddings(
                 target_provider, target_model, exclude_patterns
