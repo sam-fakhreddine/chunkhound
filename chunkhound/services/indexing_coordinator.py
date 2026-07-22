@@ -820,30 +820,75 @@ class IndexingCoordinator(BaseService):
                 for batch in file_batches
             ]
 
-            # Consume results as they complete to stream progress
-            all_results: list[ParsedFileResult] = []
             completed_files = 0
-            for fut in asyncio.as_completed(futures):
-                batch_result = await fut
-                all_results.extend(batch_result)
-                # Update parse progress
+
+            def _advance_parse_progress(batch_result: list[ParsedFileResult]) -> None:
+                nonlocal completed_files
                 if parse_task is not None and self.progress:
                     inc = len(batch_result)
                     completed_files += inc
                     self.progress.advance(parse_task, inc)
                     self.progress.update(parse_task, info=f"{completed_files} parsed")
-                # Stream results to storage if callback provided
-                if on_batch is not None:
-                    try:
-                        if asyncio.iscoroutinefunction(on_batch):
-                            await on_batch(batch_result)
-                        else:
-                            on_batch(batch_result)
-                    except Exception:
-                        # Re-raise all exceptions from on_batch to propagate disk limit errors
-                        raise
 
-        return all_results
+            if on_batch is None:
+                # Collect-and-return mode (single-file and test callers)
+                all_results: list[ParsedFileResult] = []
+                for fut in asyncio.as_completed(futures):
+                    batch_result = await fut
+                    all_results.extend(batch_result)
+                    _advance_parse_progress(batch_result)
+                return all_results
+
+            # Streaming mode: hand parsed batches to on_batch through a
+            # bounded queue serviced by a dedicated consumer task. Collecting
+            # parse results never waits for storage (the previous code
+            # awaited on_batch inline, stalling result collection during
+            # every store), while the bounded queue caps how much parsed
+            # output can pile up in memory. Results are NOT accumulated here
+            # — retaining every chunk of a large corpus alongside streaming
+            # was pure memory overhead.
+            queue: asyncio.Queue[list[ParsedFileResult] | None] = asyncio.Queue(
+                maxsize=2
+            )
+
+            async def _consume() -> None:
+                while True:
+                    batch = await queue.get()
+                    if batch is None:
+                        return
+                    if asyncio.iscoroutinefunction(on_batch):
+                        await on_batch(batch)
+                    else:
+                        on_batch(batch)
+
+            consumer = asyncio.create_task(_consume())
+            try:
+                for fut in asyncio.as_completed(futures):
+                    batch_result = await fut
+                    _advance_parse_progress(batch_result)
+                    put_task = asyncio.ensure_future(queue.put(batch_result))
+                    done, _ = await asyncio.wait(
+                        {put_task, consumer}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if consumer in done:
+                        # Consumer only finishes early by raising (e.g. disk
+                        # limit exceeded) — propagate instead of deadlocking
+                        # on a queue nobody drains.
+                        put_task.cancel()
+                        consumer.result()
+                        raise RuntimeError("store consumer exited prematurely")
+                    await put_task
+                await queue.put(None)
+                await consumer
+            except BaseException:
+                consumer.cancel()
+                try:
+                    await consumer
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
+
+        return []
 
     def _check_disk_usage_limit(self) -> DiskUsageLimitExceededError | None:
         """Check if database size exceeds configured limit.
