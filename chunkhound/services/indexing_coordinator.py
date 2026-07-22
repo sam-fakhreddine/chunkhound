@@ -974,12 +974,16 @@ class IndexingCoordinator(BaseService):
         results: list[ParsedFileResult],
         file_task: TaskID | None = None,
         cumulative_counters: dict[str, int] | None = None,
+        known_new_paths: set[str] | None = None,
     ) -> dict[str, Any]:
         """Store all parsed results in database (single-threaded).
 
         Args:
             results: List of parsed file results from batch processing
             file_task: Optional progress task ID for tracking
+            known_new_paths: Relative posix paths that the change-detection
+                pre-scan proved absent from the DB. For these files the
+                per-file existence SELECTs are skipped entirely.
 
         Returns:
             Dictionary with processing statistics. For single-file callers,
@@ -1087,8 +1091,17 @@ class IndexingCoordinator(BaseService):
                 file_stat = _StatResult(result.file_size, result.file_mtime)
                 # Extract content hash if available (from parsing result or precomputed)
                 content_hash = getattr(result, "content_hash", None)
+                assume_new = (
+                    known_new_paths is not None
+                    and self._get_relative_path(result.file_path).as_posix()
+                    in known_new_paths
+                )
                 file_id, is_existing = await self._store_file_record(
-                    result.file_path, file_stat, language, content_hash
+                    result.file_path,
+                    file_stat,
+                    language,
+                    content_hash,
+                    assume_new=assume_new,
                 )
 
                 # Track file_id for single-file case
@@ -1277,7 +1290,12 @@ class IndexingCoordinator(BaseService):
 
             files_to_process: list[Path] | list[tuple[Path, str | None]] = list(files)
             skipped_unchanged = 0
+            # Relative paths proven absent from the DB by the pre-scan below.
+            # Lets the store path skip per-file existence SELECTs (None when
+            # no pre-scan ran, e.g. force_reindex).
+            known_new_paths: set[str] | None = None
             if not force_reindex:
+                known_new_paths = set()
                 _t4 = _t.perf_counter() if _t0 is not None else None
                 change_task: TaskID | None = None
                 if self.progress:
@@ -1422,6 +1440,7 @@ class IndexingCoordinator(BaseService):
                             cur_hash = self._compute_hash_with_fallback(f)
                             precomputed_hashes[str(f.resolve())] = cur_hash
                             files_to_process_with_hashes.append((f, cur_hash))
+                            known_new_paths.add(rel)
                             if cur_hash is None:
                                 reasons["error"] += 1
                             else:
@@ -1493,7 +1512,10 @@ class IndexingCoordinator(BaseService):
 
                 # Store this batch immediately
                 stats_part = await self._store_parsed_results(
-                    batch, store_task, cumulative_counters=store_progress_counters
+                    batch,
+                    store_task,
+                    cumulative_counters=store_progress_counters,
+                    known_new_paths=known_new_paths,
                 )
 
                 agg_total_files += stats_part.get("total_files", 0)
@@ -1666,6 +1688,7 @@ class IndexingCoordinator(BaseService):
         file_stat: Any,
         language: Language,
         content_hash: str | None = None,
+        assume_new: bool = False,
     ) -> tuple[int, bool]:
         """Store or update file record in database.
 
@@ -1679,26 +1702,34 @@ class IndexingCoordinator(BaseService):
             file_stat: File stat object with st_size and st_mtime
             language: Programming language of the file
             content_hash: Optional content hash for change detection
+            assume_new: Caller has already proven the file is absent from the
+                DB (change-detection pre-scan), so the existence SELECT can be
+                skipped when the provider supports it. Providers keep a
+                duplicate-key fallback, so a stale assumption degrades to the
+                legacy update path instead of corrupting data.
 
         Returns:
             Tuple of (file_id, is_existing) where is_existing indicates
             whether the file already existed in the database.
         """
         relative_path = self._get_relative_path(file_path)
-        existing_file = cast(
-            dict[str, Any] | None,
-            await self._db.get_file_by_path_async(relative_path.as_posix()),
-        )
 
-        if existing_file:
-            file_id = existing_file["id"]
-            await self._db.update_file_async(
-                file_id,
-                size_bytes=file_stat.st_size,
-                mtime=file_stat.st_mtime,
-                content_hash=content_hash,
+        insert_assume_new = getattr(self._db, "insert_file_assume_new_async", None)
+        if not (assume_new and callable(insert_assume_new)):
+            existing_file = cast(
+                dict[str, Any] | None,
+                await self._db.get_file_by_path_async(relative_path.as_posix()),
             )
-            return file_id, True
+
+            if existing_file:
+                file_id = existing_file["id"]
+                await self._db.update_file_async(
+                    file_id,
+                    size_bytes=file_stat.st_size,
+                    mtime=file_stat.st_mtime,
+                    content_hash=content_hash,
+                )
+                return file_id, True
 
         file_model = File(
             path=FilePath(relative_path.as_posix()),
@@ -1707,6 +1738,12 @@ class IndexingCoordinator(BaseService):
             language=language,
             content_hash=content_hash,
         )
+        if assume_new and callable(insert_assume_new):
+            file_id, inserted = await insert_assume_new(file_model)
+            # inserted=False means the assumption was stale (e.g. a concurrent
+            # realtime update stored the file first) — report is_existing=True
+            # so the caller runs its chunk diff instead of double-inserting.
+            return file_id, not inserted
         return await self._db.insert_file_async(file_model), False
 
     async def get_stats(self) -> dict[str, Any]:

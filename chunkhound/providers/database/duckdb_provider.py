@@ -2802,6 +2802,68 @@ class DuckDBProvider(SerialDatabaseProvider):
         """Insert file record and return file ID - delegate to file repository."""
         return self._execute_in_db_thread_sync("insert_file", file)
 
+    async def insert_file_assume_new_async(self, file: File) -> tuple[int, bool]:
+        """Insert a file record the caller proved absent from the DB.
+
+        Skips the pre-insert existence SELECT (the caller's change-detection
+        pre-scan already answered it). Returns (file_id, inserted). A stale
+        assumption is safe: the UNIQUE(path) violation falls back to the
+        legacy update path and reports inserted=False so callers apply their
+        existing-file chunk diff.
+        """
+        return cast(
+            tuple[int, bool],
+            await self._execute_in_db_thread("insert_file_assume_new", file),
+        )
+
+    def _executor_insert_file_assume_new(
+        self, conn: Any, state: dict[str, Any], file: File
+    ) -> tuple[int, bool]:
+        """Executor method for insert_file_assume_new - runs in DB thread."""
+        try:
+            return self._executor_insert_file_row(conn, file), True
+        except Exception as e:
+            if "Duplicate key" in str(e) and "violates unique constraint" in str(e):
+                existing = self._executor_get_file_by_path(
+                    conn, state, str(file.path), False
+                )
+                if existing and "id" in existing:
+                    logger.info(
+                        f"File assumed new already exists, updating: {file.path}"
+                    )
+                    self._executor_update_file(
+                        conn,
+                        state,
+                        existing["id"],
+                        file.size_bytes if hasattr(file, "size_bytes") else None,
+                        file.mtime if hasattr(file, "mtime") else None,
+                        getattr(file, "content_hash", None),
+                    )
+                    return existing["id"], False
+            raise
+
+    def _executor_insert_file_row(self, conn: Any, file: File) -> int:
+        """INSERT one files row and return its id (no existence handling)."""
+        result = conn.execute(
+            """
+            INSERT INTO files (path, name, extension, size, modified_time, content_hash, language)
+            VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?)
+            RETURNING id
+        """,
+            [
+                file.path,  # Store path as-is (now relative with forward slashes)
+                file.name if hasattr(file, "name") else Path(file.path).name,
+                file.extension
+                if hasattr(file, "extension")
+                else Path(file.path).suffix,
+                file.size_bytes if hasattr(file, "size_bytes") else None,
+                file.mtime if hasattr(file, "mtime") else None,
+                getattr(file, "content_hash", None),
+                file.language.value if file.language else None,
+            ],
+        )
+        return int(result.fetchone()[0])
+
     def _executor_insert_file(
         self, conn: Any, state: dict[str, Any], file: File
     ) -> int:
@@ -2824,28 +2886,7 @@ class DuckDBProvider(SerialDatabaseProvider):
                 )
                 return file_id
 
-            # No existing file, insert new one
-            result = conn.execute(
-                """
-                INSERT INTO files (path, name, extension, size, modified_time, content_hash, language)
-                VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?)
-                RETURNING id
-            """,
-                [
-                    file.path,  # Store path as-is (now relative with forward slashes)
-                    file.name if hasattr(file, "name") else Path(file.path).name,
-                    file.extension
-                    if hasattr(file, "extension")
-                    else Path(file.path).suffix,
-                    file.size_bytes if hasattr(file, "size_bytes") else None,
-                    file.mtime if hasattr(file, "mtime") else None,
-                    getattr(file, "content_hash", None),
-                    file.language.value if file.language else None,
-                ],
-            )
-
-            file_id = result.fetchone()[0]
-            return file_id
+            return self._executor_insert_file_row(conn, file)
 
         except Exception as e:
             # Handle duplicate key errors
