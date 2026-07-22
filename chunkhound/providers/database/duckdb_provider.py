@@ -278,6 +278,12 @@ class DuckDBProvider(SerialDatabaseProvider):
             }
         }
 
+        # While True (between drop_all_hnsw_indexes and
+        # ensure_all_hnsw_indexes), newly created embedding tables defer their
+        # HNSW index to the ensure step. Only touched from the executor thread
+        # after connect; initialized here for a defined default.
+        self._hnsw_bulk_defer = False
+
     def _create_connection(self) -> Any:
         """Create and return a DuckDB connection.
 
@@ -1008,7 +1014,17 @@ class DuckDBProvider(SerialDatabaseProvider):
         if not self._executor_table_exists(conn, state, table_name):
             logger.info(f"Creating embedding table for {dims} dimensions: {table_name}")
             conn.execute(_create_embedding_table_sql(dims))
-            self._executor_create_embedding_table_indexes(conn, state, table_name, dims)
+            # During a bulk run (drop_all_hnsw_indexes .. ensure_all_hnsw_indexes)
+            # the HNSW index is deferred to the ensure step; creating it here
+            # would put index maintenance + per-checkpoint re-serialization
+            # back into every bulk embedding insert.
+            self._executor_create_embedding_table_indexes(
+                conn,
+                state,
+                table_name,
+                dims,
+                create_hnsw=not getattr(self, "_hnsw_bulk_defer", False),
+            )
             return table_name
 
         self._executor_reseed_sequence(conn, table_name, "embeddings_id_seq")
@@ -2294,7 +2310,21 @@ class DuckDBProvider(SerialDatabaseProvider):
         so custom-named HNSW indexes are properly dropped.  Previously the name-pattern
         filter (``LIKE 'hnsw_%'``) missed indexes like ``alt_live_idx`` that use
         ``USING HNSW``.
+
+        Also enters HNSW-deferred bulk mode: embedding tables created while it
+        is active (the cold-index case, where no table exists yet when indexes
+        are dropped) are created WITHOUT their HNSW index, so bulk inserts and
+        checkpoints never carry index maintenance. VSS re-serializes the whole
+        index into the DB file on every checkpoint, so a live index during a
+        bulk load makes file growth quadratic in batch count — measured 27 GB
+        for ~700 MB of vectors before this change.
+        ``_executor_ensure_all_hnsw_indexes`` exits the mode and builds the
+        indexes once. If a bulk run dies before that, semantic search on new
+        tables falls back to a sequential scan (correct, slower) until the
+        next completed run rebuilds — the same recovery story as a crash
+        between the existing drop/ensure pair.
         """
+        self._hnsw_bulk_defer = True
         indexes = self._executor_get_existing_vector_indexes(conn, state)
         dropped = 0
         for idx in indexes:
@@ -2310,6 +2340,9 @@ class DuckDBProvider(SerialDatabaseProvider):
         self, conn: Any, state: dict[str, Any]
     ) -> None:
         """Create canonical HNSW indexes on all embedding tables that have data."""
+        # Exit bulk mode first so tables created after this point get their
+        # HNSW index at creation time again (realtime behavior).
+        self._hnsw_bulk_defer = False
         tables = conn.execute(
             "SELECT table_name FROM information_schema.tables "
             f"WHERE {_embedding_tables_where_clause()}"
@@ -3778,7 +3811,7 @@ class DuckDBProvider(SerialDatabaseProvider):
 
         try:
             # Group embeddings by dimension
-            embeddings_by_dims = {}
+            embeddings_by_dims: dict[int, list[dict[str, Any]]] = {}
             for emb_data in embeddings_data:
                 dims = emb_data["dims"]
                 if dims not in embeddings_by_dims:
@@ -3822,7 +3855,16 @@ class DuckDBProvider(SerialDatabaseProvider):
                     total_inserted += len(batch_data)
 
             if transaction_started:
-                self._executor_commit_transaction(conn, state, True)
+                # Plain COMMIT — durability comes from the WAL; DuckDB's
+                # auto-checkpoint (16MB WAL threshold) handles compaction.
+                # Forcing CHECKPOINT here made every embedding batch
+                # re-serialize any live HNSW index into the DB file: with N
+                # batches that is O(N^2) file growth (measured 27 GB for
+                # ~700 MB of vectors) and dominated embed-phase time.
+                # Committed embeddings are visible to same-connection queries
+                # and survive reopen via WAL replay — covered by the reopen
+                # guardrail test.
+                self._executor_commit_transaction(conn, state, False)
                 transaction_started = False
 
             return total_inserted
