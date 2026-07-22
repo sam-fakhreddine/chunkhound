@@ -257,6 +257,11 @@ class IndexingCoordinator(BaseService):
         self._file_locks: dict[str, asyncio.Lock] = {}
         self._locks_lock = None  # Will be initialized when first needed
 
+        # Serializes multi-dispatch DB transactions (batched store) against
+        # streamed embedding inserts so an embedding write can never land
+        # inside another task's open transaction on the single DB connection.
+        self._db_txn_lock: asyncio.Lock | None = None
+
         # Base directory for path normalization (immutable after initialization)
         # Store raw path - will resolve at usage time for consistent symlink handling
         self._base_directory: Path = base_directory
@@ -469,6 +474,12 @@ class IndexingCoordinator(BaseService):
         est = max(1, budget // avg)
         est = max(1000, min(int(est), 20000))
         return est
+
+    def _get_db_txn_lock(self) -> asyncio.Lock:
+        """Lazily create the DB-transaction lock inside the event loop."""
+        if self._db_txn_lock is None:
+            self._db_txn_lock = asyncio.Lock()
+        return self._db_txn_lock
 
     async def _get_file_lock(self, file_path: Path) -> asyncio.Lock:
         """Get or create a lock for the given file path.
@@ -1243,34 +1254,35 @@ class IndexingCoordinator(BaseService):
         ]
         prepare_files_batch = self._db.prepare_files_batch_async  # type: ignore[attr-defined]
 
-        await self._db.begin_transaction_async()
-        try:
-            prepared = await prepare_files_batch(file_models)
+        async with self._get_db_txn_lock():
+            await self._db.begin_transaction_async()
+            try:
+                prepared = await prepare_files_batch(file_models)
 
-            all_delete_ids: list[int] = []
-            all_insert_models: list[Chunk] = []
-            per_file_counts: list[int] = []
-            for result, (file_id, _is_existing, existing_chunks) in zip(
-                storable, prepared
-            ):
-                ids_to_delete, chunks_to_store = self._diff_and_validate_chunks(
-                    result, file_id, existing_chunks
+                all_delete_ids: list[int] = []
+                all_insert_models: list[Chunk] = []
+                per_file_counts: list[int] = []
+                for result, (file_id, _is_existing, existing_chunks) in zip(
+                    storable, prepared
+                ):
+                    ids_to_delete, chunks_to_store = self._diff_and_validate_chunks(
+                        result, file_id, existing_chunks
+                    )
+                    all_delete_ids.extend(ids_to_delete)
+                    all_insert_models.extend(chunks_to_store)
+                    per_file_counts.append(len(chunks_to_store))
+
+                if all_delete_ids:
+                    await self._db.delete_chunks_batch_async(all_delete_ids)
+                inserted_ids: list[int] = (
+                    await self._db.insert_chunks_batch_async(all_insert_models)
+                    if all_insert_models
+                    else []
                 )
-                all_delete_ids.extend(ids_to_delete)
-                all_insert_models.extend(chunks_to_store)
-                per_file_counts.append(len(chunks_to_store))
-
-            if all_delete_ids:
-                await self._db.delete_chunks_batch_async(all_delete_ids)
-            inserted_ids: list[int] = (
-                await self._db.insert_chunks_batch_async(all_insert_models)
-                if all_insert_models
-                else []
-            )
-            await self._db.commit_transaction_async(force_checkpoint=False)
-        except Exception:
-            await self._db.rollback_transaction_async()
-            raise
+                await self._db.commit_transaction_async(force_checkpoint=False)
+            except Exception:
+                await self._db.rollback_transaction_async()
+                raise
 
         stats["chunk_ids_needing_embeddings"].extend(inserted_ids)
         for chunk_id, model in zip(inserted_ids, all_insert_models):
@@ -1299,6 +1311,21 @@ class IndexingCoordinator(BaseService):
         known_new_paths: set[str] | None,
     ) -> None:
         """Store one parsed file in its own transaction (legacy per-file path)."""
+        async with self._get_db_txn_lock():
+            await self._store_single_parsed_result_locked(
+                result, stats, file_ids, file_task, cumulative_counters, known_new_paths
+            )
+
+    async def _store_single_parsed_result_locked(
+        self,
+        result: ParsedFileResult,
+        stats: dict[str, Any],
+        file_ids: list[int],
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+        known_new_paths: set[str] | None,
+    ) -> None:
+        """Body of _store_single_parsed_result; caller holds the DB txn lock."""
         try:
             await self._db.begin_transaction_async()
             # Create stat object for _store_file_record
@@ -1643,6 +1670,80 @@ class IndexingCoordinator(BaseService):
                 "errors": 0,
             }
 
+            # Streamed embedding: start embedding a batch's chunks as soon as
+            # that batch is committed instead of waiting for 100% of storage.
+            # The final generate_missing_embeddings sweep still runs and
+            # remains the completeness guarantee — streamed failures degrade
+            # to sweep work, never to lost embeddings.
+            # CHUNKHOUND_STREAM_EMBEDDINGS=0 restores the sweep-only flow.
+            stream_embeddings = self._embedding_provider is not None and os.environ.get(
+                "CHUNKHOUND_STREAM_EMBEDDINGS", "1"
+            ) != "0"
+            embed_tasks: list[asyncio.Task[int]] = []
+            # Match the sweep's parallelism so streaming never embeds with
+            # less concurrency than the sequential flow it replaces.
+            embed_concurrency = 8
+            stream_task_chunks = 300
+            if stream_embeddings and self._embedding_provider is not None:
+                get_conc = getattr(
+                    self._embedding_provider, "get_recommended_concurrency", None
+                )
+                if callable(get_conc):
+                    try:
+                        embed_concurrency = max(1, int(get_conc()))
+                    except Exception:
+                        pass
+                provider_batch = getattr(self._embedding_provider, "batch_size", None)
+                if isinstance(provider_batch, int) and provider_batch > 0:
+                    # One provider request per task keeps tasks from
+                    # serializing internally behind embed_batch's own split.
+                    stream_task_chunks = provider_batch
+            embed_semaphore = asyncio.Semaphore(embed_concurrency)
+            STREAM_EMBED_TASK_CHUNKS = stream_task_chunks
+
+            async def _embed_pairs(pairs: list[tuple[int, dict[str, Any]]]) -> int:
+                # Embed EXACTLY the text the missing-embeddings sweep would
+                # embed (raw stored chunk code) so streamed and swept chunks
+                # get identical vectors and search results stay byte-for-byte
+                # comparable with the sequential flow.
+                # NOTE: process_file (realtime) instead embeds
+                # format_chunk_for_embedding(...) output — a pre-existing
+                # formatting inconsistency between the two embed paths that is
+                # deliberately NOT resolved here.
+                provider = self._embedding_provider
+                if provider is None:
+                    return 0
+                async with embed_semaphore:
+                    try:
+                        valid = [
+                            (chunk_id, chunk_dict.get("code") or "")
+                            for chunk_id, chunk_dict in pairs
+                        ]
+                        valid = [(cid, text) for cid, text in valid if text.strip()]
+                        if not valid:
+                            return 0
+                        vectors = await provider.embed_batch(
+                            [text for _, text in valid]
+                        )
+                        embeddings_data = [
+                            {
+                                "chunk_id": chunk_id,
+                                "provider": provider.name,
+                                "model": provider.model,
+                                "dims": len(vector),
+                                "embedding": vector,
+                            }
+                            for (chunk_id, _), vector in zip(valid, vectors)
+                        ]
+                        return await self._insert_embeddings_locked(
+                            embeddings_data, None
+                        )
+                    except Exception as e:
+                        # Leftovers are picked up by the missing-embeddings
+                        # sweep after storage completes.
+                        logger.warning(f"Streamed embedding batch failed: {e}")
+                        return 0
+
             async def _on_batch_store(batch: list[ParsedFileResult]) -> None:
                 nonlocal \
                     agg_total_files, \
@@ -1671,15 +1772,45 @@ class IndexingCoordinator(BaseService):
                 agg_errors.extend(stats_part.get("errors", []))
                 agg_skipped_paths.extend(stats_part.get("skipped_paths", []))
 
+                if stream_embeddings:
+                    pairs = stats_part.get("chunks_for_embedding") or []
+                    for start in range(0, len(pairs), STREAM_EMBED_TASK_CHUNKS):
+                        embed_tasks.append(
+                            asyncio.create_task(
+                                _embed_pairs(
+                                    pairs[start : start + STREAM_EMBED_TASK_CHUNKS]
+                                )
+                            )
+                        )
+
             # Parse files (streaming progress as batches complete and store concurrently)
             # Pass files_to_process directly - preserves hash for each file
             # Results flow to storage via on_batch=_on_batch_store; return value unused.
-            await self._process_files_in_batches(
-                files_to_process,
-                config_file_size_threshold_kb,
-                parse_task,
-                on_batch=_on_batch_store,
-            )
+            try:
+                await self._process_files_in_batches(
+                    files_to_process,
+                    config_file_size_threshold_kb,
+                    parse_task,
+                    on_batch=_on_batch_store,
+                )
+            except BaseException:
+                for embed_task in embed_tasks:
+                    embed_task.cancel()
+                raise
+
+            # Drain streamed embedding work before reporting/compaction.
+            streamed_embeddings = 0
+            if embed_tasks:
+                embed_results = await asyncio.gather(
+                    *embed_tasks, return_exceptions=True
+                )
+                streamed_embeddings = sum(
+                    r for r in embed_results if isinstance(r, int)
+                )
+                logger.debug(
+                    f"Streamed {streamed_embeddings} embeddings across "
+                    f"{len(embed_tasks)} tasks during storage"
+                )
 
             # Mark parse task complete
             if parse_task is not None and self.progress:
@@ -1787,6 +1918,7 @@ class IndexingCoordinator(BaseService):
                 "skipped_due_to_timeout": skipped_due_to_timeout,
                 "skipped_unchanged": skipped_unchanged,
                 "skipped_filtered": skipped_filtered,
+                "streamed_embeddings": streamed_embeddings,
             }
 
         except Exception as e:
@@ -2145,8 +2277,8 @@ class IndexingCoordinator(BaseService):
             # from a previous operation. Try insertion, and if we get a transaction error,
             # clean up and retry once.
             try:
-                result = self._db.insert_embeddings_batch(
-                    embeddings_data, connection=connection
+                result = await self._insert_embeddings_locked(
+                    embeddings_data, connection
                 )
                 return result
             except Exception as e:
@@ -2162,8 +2294,8 @@ class IndexingCoordinator(BaseService):
                         pass  # Ignore errors during cleanup
 
                     # Retry the insertion with a fresh transaction
-                    result = self._db.insert_embeddings_batch(
-                        embeddings_data, connection=connection
+                    result = await self._insert_embeddings_locked(
+                        embeddings_data, connection
                     )
                     logger.info(
                         f"[IndexCoord] Successfully inserted {result} embeddings after "
@@ -2182,6 +2314,25 @@ class IndexingCoordinator(BaseService):
                 f"[IndexCoord] Failed to generate embeddings (chunks: {len(text_sizes)}, max_chars: {max_chars}): {e}"
             )
             return 0
+
+    async def _insert_embeddings_locked(
+        self, embeddings_data: list[dict[str, Any]], connection: Any
+    ) -> int:
+        """Insert embeddings under the DB txn lock.
+
+        The lock keeps the insert from being dispatched into the middle of a
+        concurrently running multi-dispatch store transaction (streamed
+        embedding mode). Uses the provider's async insert when available so
+        the event loop is not blocked for the duration of the upsert.
+        """
+        insert_async = getattr(self._db, "insert_embeddings_batch_async", None)
+        async with self._get_db_txn_lock():
+            if callable(insert_async):
+                inserted: int = await insert_async(embeddings_data)
+                return inserted
+            return self._db.insert_embeddings_batch(
+                embeddings_data, connection=connection
+            )
 
     async def _generate_embeddings_batch(
         self, file_chunks: list[tuple[int, dict[str, Any]]]

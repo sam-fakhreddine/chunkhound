@@ -3873,6 +3873,55 @@ class DuckDBProvider(SerialDatabaseProvider):
                 self._executor_rollback_transaction(conn, state)
             raise
 
+    async def insert_embeddings_batch_async(
+        self,
+        embeddings_data: list[dict],
+        batch_size: int | None = None,
+    ) -> int:
+        """Async variant of insert_embeddings_batch.
+
+        Lets embedding pipelines await the DB write instead of blocking the
+        event loop for the duration of an executemany upsert.
+        """
+        return cast(
+            int,
+            await self._execute_in_db_thread(
+                "insert_embeddings_batch", embeddings_data, batch_size
+            ),
+        )
+
+    def count_chunks_missing_embeddings(self, provider: str, model: str) -> int:
+        """Count chunks with no embedding for the given provider/model.
+
+        Cheap COUNT-only query so 'is there anything to embed?' does not
+        require loading every chunk (with code) into memory.
+        """
+        return cast(
+            int,
+            self._execute_in_db_thread_sync(
+                "count_chunks_missing_embeddings", provider, model
+            ),
+        )
+
+    def _executor_count_chunks_missing_embeddings(
+        self, conn: Any, state: dict[str, Any], provider: str, model: str
+    ) -> int:
+        """Executor method for count_chunks_missing_embeddings - runs in DB thread."""
+        embedding_tables = self._executor_get_all_embedding_tables(conn, state)
+        if not embedding_tables:
+            return int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        not_exists_clauses = [
+            f"NOT EXISTS (SELECT 1 FROM {table_name} e "
+            "WHERE e.chunk_id = c.id AND e.provider = ? AND e.model = ?)"
+            for table_name in embedding_tables
+        ]
+        query = (
+            "SELECT COUNT(*) FROM chunks c WHERE "
+            + " AND ".join(not_exists_clauses)
+        )
+        params = [provider, model] * len(embedding_tables)
+        return int(conn.execute(query, params).fetchone()[0])
+
     def get_embedding_by_chunk_id(
         self, chunk_id: int, provider: str, model: str
     ) -> Embedding | None:
