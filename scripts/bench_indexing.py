@@ -39,6 +39,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,60 @@ def _make_bench_provider(dims: int, latency_ms: float):
             return await asyncio.to_thread(_vectors)
 
     return BenchEmbeddingProvider()
+
+
+class _DbSizeSampler:
+    """Samples total DB-dir size in a thread: peak size + a hard disk guard.
+
+    Peak size is a first-class benchmark metric — write amplification during
+    the embed phase (HNSW re-serialization on frequent checkpoints) can grow
+    the DB file orders of magnitude beyond the final size, and the final
+    (post-compaction) size hides that entirely. The guard aborts the run
+    before a runaway DB file exhausts the container's disk allowance.
+    """
+
+    def __init__(self, db_dir: Path, max_bytes: int) -> None:
+        self._db_dir = db_dir
+        self._max_bytes = max_bytes
+        self.peak_bytes = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _sample(self) -> int:
+        total = 0
+        try:
+            for p in self._db_dir.rglob("*"):
+                try:
+                    if p.is_file():
+                        total += p.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return total
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            size = self._sample()
+            if size > self.peak_bytes:
+                self.peak_bytes = size
+            if self._max_bytes and size > self._max_bytes:
+                print(
+                    f"BENCH_ABORT: DB size {size / 1e9:.1f} GB exceeded cap "
+                    f"{self._max_bytes / 1e9:.1f} GB — aborting to protect disk",
+                    flush=True,
+                )
+                os._exit(3)
+
+    def start(self) -> "_DbSizeSampler":
+        self._thread.start()
+        return self
+
+    def stop(self) -> int:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self.peak_bytes = max(self.peak_bytes, self._sample())
+        return self.peak_bytes
 
 
 class _PhaseTimer:
@@ -202,6 +257,10 @@ async def _single_run_async(args: argparse.Namespace) -> dict[str, Any]:
         database={"path": str(db_dir), "provider": "duckdb"},
     )
 
+    sampler = _DbSizeSampler(
+        db_dir, max_bytes=int(args.max_db_gb * 1e9) if args.max_db_gb else 0
+    ).start()
+
     t_connect0 = time.perf_counter()
     configure_registry(config)
     t_connect = time.perf_counter() - t_connect0
@@ -238,6 +297,8 @@ async def _single_run_async(args: argparse.Namespace) -> dict[str, Any]:
 
     db.close()
 
+    peak_db_bytes = sampler.stop()
+
     ru_self = resource.getrusage(resource.RUSAGE_SELF)
     ru_children = resource.getrusage(resource.RUSAGE_CHILDREN)
 
@@ -262,6 +323,7 @@ async def _single_run_async(args: argparse.Namespace) -> dict[str, Any]:
         "peak_rss_self_mb": round(ru_self.ru_maxrss / 1024, 1),
         "peak_rss_child_mb": round(ru_children.ru_maxrss / 1024, 1),
         "db_size_mb": round(db_size / (1024 * 1024), 1),
+        "peak_db_size_mb": round(peak_db_bytes / (1024 * 1024), 1),
         "phases_s": {k: round(v, 3) for k, v in sorted(timer.phases.items())},
         "phase_calls": timer.counts,
     }
@@ -293,6 +355,8 @@ def _drive(args: argparse.Namespace) -> None:
             str(args.dims),
             "--embed-latency-ms",
             str(args.embed_latency_ms),
+            "--max-db-gb",
+            str(args.max_db_gb),
         ]
         if args.no_embeddings:
             cmd.append("--no-embeddings")
@@ -311,15 +375,23 @@ def _drive(args: argparse.Namespace) -> None:
             )
         except StopIteration:
             _eprint(f"[bench] run {i + 1} FAILED (rc={proc.returncode}, {dt:.1f}s)")
-            _eprint(proc.stdout[-4000:])
-            _eprint(proc.stderr[-4000:])
+            log_dir = Path(tempfile.gettempdir())
+            out_log = log_dir / f"bench-fail-{os.getpid()}-run{i + 1}.stdout"
+            err_log = log_dir / f"bench-fail-{os.getpid()}-run{i + 1}.stderr"
+            out_log.write_text(proc.stdout)
+            err_log.write_text(proc.stderr)
+            _eprint(f"[bench] full child logs: {out_log} / {err_log}")
+            _eprint("\n".join(proc.stdout.splitlines()[-30:]))
+            _eprint("\n".join(proc.stderr.splitlines()[-30:]))
+            shutil.rmtree(db_dir, ignore_errors=True)
             sys.exit(1)
         result = json.loads(line.split(":", 1)[1])
         _eprint(
             f"[bench] run {i + 1}: wall={result['wall_s']}s "
             f"files={result['files_processed']} chunks={result['chunks_created']} "
             f"embeddings={result['embeddings_generated']} "
-            f"rss_self={result['peak_rss_self_mb']}MB phases={result['phases_s']}"
+            f"rss_self={result['peak_rss_self_mb']}MB "
+            f"db_peak={result.get('peak_db_size_mb')}MB phases={result['phases_s']}"
         )
         runs.append(result)
         if not args.keep_dbs:
@@ -362,6 +434,12 @@ def main() -> None:
         type=float,
         default=0.0,
         help="Simulated per-request embedding latency (network stand-in)",
+    )
+    parser.add_argument(
+        "--max-db-gb",
+        type=float,
+        default=8.0,
+        help="Abort a run if the DB directory exceeds this size (disk guard; 0=off)",
     )
     parser.add_argument("--json", help="Write full summary JSON here")
     parser.add_argument(
