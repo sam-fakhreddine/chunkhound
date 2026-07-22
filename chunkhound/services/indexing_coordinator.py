@@ -36,7 +36,7 @@ from chunkhound.core.detection import detect_language
 from chunkhound.core.diagnostics.batch_metrics import BatchMetricsCollector
 from chunkhound.core.exceptions import DiskUsageLimitExceededError
 from chunkhound.core.models import Chunk, File
-from chunkhound.core.types.common import FilePath, Language
+from chunkhound.core.types.common import FilePath, Language, Timestamp
 from chunkhound.core.utils import estimate_tokens_chunking
 from chunkhound.core.utils.path_utils import get_relative_path_safe
 from chunkhound.interfaces.database_provider import DatabaseProvider
@@ -603,9 +603,15 @@ class IndexingCoordinator(BaseService):
                     # NOTE: Transaction management is handled internally by the database provider
                     # to avoid transaction context issues during concurrent operations
                     try:
+                        # Use the (id, chunk) pairs stored by _store_parsed_results.
+                        # Zipping ids against ALL parsed chunks is wrong whenever
+                        # the smart diff kept unchanged chunks: the id list only
+                        # covers added+modified chunks, so the lists diverge and
+                        # embedding generation fails with a length mismatch.
+                        pairs = stats["chunks_for_embedding"]
                         embeddings_generated = await self._generate_embeddings(
-                            stats["chunk_ids_needing_embeddings"],
-                            [chunk for r in parsed_results for chunk in r.chunks],
+                            [chunk_id for chunk_id, _ in pairs],
+                            [chunk_dict for _, chunk_dict in pairs],
                         )
 
                         # Verify embeddings were actually generated
@@ -994,6 +1000,10 @@ class IndexingCoordinator(BaseService):
             "total_chunks": 0,
             "errors": [],
             "chunk_ids_needing_embeddings": [],
+            # (chunk_id, chunk_dict) pairs aligned by construction — the
+            # embedding path must never re-derive this pairing by zipping
+            # separate lists of different lengths.
+            "chunks_for_embedding": [],
         }
 
         # Check disk usage limit before storing data
@@ -1015,27 +1025,16 @@ class IndexingCoordinator(BaseService):
         # Track file_ids for single-file case
         file_ids: list[int] = []
 
-        # Process each file independently (per-file transaction)
+        storable: list[ParsedFileResult] = []
         for result in results:
             # Handle errors
             if result.status == "error":
                 stats["errors"].append(
                     {"file": str(result.file_path), "error": result.error}
                 )
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["errors"] = (
-                            cumulative_counters.get("errors", 0) + 1
-                        )
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        chunks_so_far = cumulative_counters.get("chunks", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, chunks_so_far),
-                        )
+                self._advance_store_progress(
+                    file_task, cumulative_counters, "errors", stats
+                )
                 continue
 
             # Handle skipped files
@@ -1065,140 +1064,46 @@ class IndexingCoordinator(BaseService):
                         "Failed to record skipped file in DB; next run will re-evaluate",
                         exc_info=True,
                     )
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["skipped"] = (
-                            cumulative_counters.get("skipped", 0) + 1
-                        )
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        chunks_so_far = cumulative_counters.get("chunks", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, chunks_so_far),
-                        )
+                self._advance_store_progress(
+                    file_task, cumulative_counters, "skipped", stats
+                )
                 continue
 
-            # Detect language for storage
-            language = result.language
+            storable.append(result)
 
-            # Per-file transaction boundaries
-            try:
-                await self._db.begin_transaction_async()
-                # Create stat object for _store_file_record
-                file_stat = _StatResult(result.file_size, result.file_mtime)
-                # Extract content hash if available (from parsing result or precomputed)
-                content_hash = getattr(result, "content_hash", None)
-                assume_new = (
-                    known_new_paths is not None
-                    and self._get_relative_path(result.file_path).as_posix()
-                    in known_new_paths
-                )
-                file_id, is_existing = await self._store_file_record(
-                    result.file_path,
-                    file_stat,
-                    language,
-                    content_hash,
-                    assume_new=assume_new,
-                )
-
-                # Track file_id for single-file case
-                file_ids.append(file_id)
-
-                # Convert result chunks to Chunk models using from_dict()
-                new_chunk_models = [
-                    Chunk.from_dict({**chunk_data, "file_id": file_id})
-                    for chunk_data in result.chunks
-                ]
-
-                existing_chunks: list[Chunk]
-                if is_existing:
-                    existing_chunks = cast(
-                        list[Chunk],
-                        await self._db.get_chunks_by_file_id_async(
-                            file_id, as_model=True
-                        ),
+        # Store all parseable files: one transaction + batched statements per
+        # call when the provider supports it, falling back to the per-file
+        # path (its own transaction per file) on any batch failure so a
+        # single pathological file cannot poison its whole batch.
+        if storable:
+            batched = False
+            if len(storable) > 1 and callable(
+                getattr(self._db, "prepare_files_batch_async", None)
+            ):
+                try:
+                    await self._store_results_batched(
+                        storable, stats, file_ids, file_task, cumulative_counters
                     )
-                else:
-                    existing_chunks = []
-
-                if existing_chunks:
-                    # Smart diff to preserve embeddings
-                    chunk_diff = self._chunk_cache.diff_chunks(
-                        new_chunk_models, existing_chunks
+                    batched = True
+                except Exception as e:
+                    logger.warning(
+                        f"Batched store of {len(storable)} files failed; "
+                        f"retrying per-file: {e}"
                     )
-
-                    # Delete modified/removed chunks
-                    chunks_to_delete = chunk_diff.deleted + chunk_diff.modified
-                    if chunks_to_delete:
-                        chunk_ids_to_delete = [
-                            int(chunk.id)
-                            for chunk in chunks_to_delete
-                            if chunk.id is not None
-                        ]
-                        if chunk_ids_to_delete:
-                            await self._db.delete_chunks_batch_async(
-                                chunk_ids_to_delete
-                            )
-
-                    # Store new/modified chunks (pass models directly)
-                    chunks_to_store = chunk_diff.added + chunk_diff.modified
-                    chunks_to_store = self._validate_chunk_sizes(chunks_to_store)
-                    ids = (
-                        await self._db.insert_chunks_batch_async(chunks_to_store)
-                        if chunks_to_store
-                        else []
+                    try:
+                        await self._db.rollback_transaction_async()
+                    except Exception:
+                        pass
+            if not batched:
+                for result in storable:
+                    await self._store_single_parsed_result(
+                        result,
+                        stats,
+                        file_ids,
+                        file_task,
+                        cumulative_counters,
+                        known_new_paths,
                     )
-                else:
-                    # New file or existing file with no chunks — store all
-                    new_chunk_models = self._validate_chunk_sizes(new_chunk_models)
-                    ids = await self._db.insert_chunks_batch_async(new_chunk_models)
-                logger.debug(f"Batch inserted {len(ids)} chunks for file_id {file_id}")
-                stats["chunk_ids_needing_embeddings"].extend(ids)
-                stats["total_chunks"] += len(ids)
-                # Count this file as processed successfully (stored or updated)
-                stats["total_files"] += 1
-
-                # Commit per-file; threshold-based checkpointing manages WAL compaction
-                await self._db.commit_transaction_async(force_checkpoint=False)
-
-                # Update progress
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["stored"] = (
-                            cumulative_counters.get("stored", 0) + 1
-                        )
-                        base = int(cumulative_counters.get("chunks", 0))
-                        display_chunks = base + stats["total_chunks"]
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, display_chunks),
-                        )
-
-            except Exception as e:
-                await self._db.rollback_transaction_async()
-                stats["errors"].append({"file": str(result.file_path), "error": str(e)})
-                if file_task is not None and self.progress:
-                    self.progress.advance(file_task, 1)
-                    if cumulative_counters is not None:
-                        cumulative_counters["errors"] = (
-                            cumulative_counters.get("errors", 0) + 1
-                        )
-                        stored = cumulative_counters.get("stored", 0)
-                        skipped = cumulative_counters.get("skipped", 0)
-                        errs = cumulative_counters.get("errors", 0)
-                        chunks_so_far = cumulative_counters.get("chunks", 0)
-                        self.progress.update(
-                            file_task,
-                            info=_progress_info(stored, skipped, errs, chunks_so_far),
-                        )
-                continue
 
         # Update external cumulative counters
         if cumulative_counters is not None:
@@ -1213,6 +1118,204 @@ class IndexingCoordinator(BaseService):
         if len(results) == 1 and file_ids and file_ids[0] is not None:
             stats["file_id"] = file_ids[0]
         return stats
+
+    def _advance_store_progress(
+        self,
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+        kind: str,
+        stats: dict[str, Any],
+    ) -> None:
+        """Advance the store progress bar by one file of the given kind."""
+        if file_task is None or not self.progress:
+            return
+        self.progress.advance(file_task, 1)
+        if cumulative_counters is None:
+            return
+        cumulative_counters[kind] = cumulative_counters.get(kind, 0) + 1
+        stored = cumulative_counters.get("stored", 0)
+        skipped = cumulative_counters.get("skipped", 0)
+        errs = cumulative_counters.get("errors", 0)
+        display_chunks = cumulative_counters.get("chunks", 0)
+        if kind == "stored":
+            # Chunks stored in this call are folded into the external counter
+            # only after the call completes; show them live meanwhile.
+            display_chunks += stats["total_chunks"]
+        self.progress.update(
+            file_task,
+            info=_progress_info(stored, skipped, errs, display_chunks),
+        )
+
+    def _diff_and_validate_chunks(
+        self,
+        result: ParsedFileResult,
+        file_id: int,
+        existing_chunks: list[Chunk],
+    ) -> tuple[list[int], list[Chunk]]:
+        """Compute (chunk ids to delete, validated chunk models to insert)."""
+        new_chunk_models = [
+            Chunk.from_dict({**chunk_data, "file_id": file_id})
+            for chunk_data in result.chunks
+        ]
+        if not existing_chunks:
+            return [], self._validate_chunk_sizes(new_chunk_models)
+
+        # Smart diff to preserve embeddings
+        chunk_diff = self._chunk_cache.diff_chunks(new_chunk_models, existing_chunks)
+        ids_to_delete = [
+            int(chunk.id)
+            for chunk in chunk_diff.deleted + chunk_diff.modified
+            if chunk.id is not None
+        ]
+        chunks_to_store = self._validate_chunk_sizes(
+            chunk_diff.added + chunk_diff.modified
+        )
+        return ids_to_delete, chunks_to_store
+
+    async def _store_results_batched(
+        self,
+        storable: list[ParsedFileResult],
+        stats: dict[str, Any],
+        file_ids: list[int],
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+    ) -> None:
+        """Store a whole parsed batch in one transaction with batched statements.
+
+        Executor dispatches per batch: begin + prepare_files_batch +
+        [delete_chunks_batch] + insert_chunks_batch + commit — instead of
+        5-7 dispatches per file.
+        """
+        file_models = [
+            File(
+                path=FilePath(self._get_relative_path(r.file_path).as_posix()),
+                size_bytes=r.file_size,
+                mtime=Timestamp(r.file_mtime),
+                language=r.language,
+                content_hash=getattr(r, "content_hash", None),
+            )
+            for r in storable
+        ]
+        prepare_files_batch = self._db.prepare_files_batch_async  # type: ignore[attr-defined]
+
+        await self._db.begin_transaction_async()
+        try:
+            prepared = await prepare_files_batch(file_models)
+
+            all_delete_ids: list[int] = []
+            all_insert_models: list[Chunk] = []
+            per_file_counts: list[int] = []
+            for result, (file_id, _is_existing, existing_chunks) in zip(
+                storable, prepared
+            ):
+                ids_to_delete, chunks_to_store = self._diff_and_validate_chunks(
+                    result, file_id, existing_chunks
+                )
+                all_delete_ids.extend(ids_to_delete)
+                all_insert_models.extend(chunks_to_store)
+                per_file_counts.append(len(chunks_to_store))
+
+            if all_delete_ids:
+                await self._db.delete_chunks_batch_async(all_delete_ids)
+            inserted_ids: list[int] = (
+                await self._db.insert_chunks_batch_async(all_insert_models)
+                if all_insert_models
+                else []
+            )
+            await self._db.commit_transaction_async(force_checkpoint=False)
+        except Exception:
+            await self._db.rollback_transaction_async()
+            raise
+
+        stats["chunk_ids_needing_embeddings"].extend(inserted_ids)
+        for chunk_id, model in zip(inserted_ids, all_insert_models):
+            stats["chunks_for_embedding"].append((chunk_id, model.to_dict()))
+        logger.debug(
+            f"Batch stored {len(storable)} files / {len(inserted_ids)} chunks "
+            f"in one transaction"
+        )
+        for (file_id, _is_existing, _existing), count in zip(
+            prepared, per_file_counts
+        ):
+            file_ids.append(file_id)
+            stats["total_chunks"] += count
+            stats["total_files"] += 1
+            self._advance_store_progress(
+                file_task, cumulative_counters, "stored", stats
+            )
+
+    async def _store_single_parsed_result(
+        self,
+        result: ParsedFileResult,
+        stats: dict[str, Any],
+        file_ids: list[int],
+        file_task: TaskID | None,
+        cumulative_counters: dict[str, int] | None,
+        known_new_paths: set[str] | None,
+    ) -> None:
+        """Store one parsed file in its own transaction (legacy per-file path)."""
+        try:
+            await self._db.begin_transaction_async()
+            # Create stat object for _store_file_record
+            file_stat = _StatResult(result.file_size, result.file_mtime)
+            # Extract content hash if available (from parsing result or precomputed)
+            content_hash = getattr(result, "content_hash", None)
+            assume_new = (
+                known_new_paths is not None
+                and self._get_relative_path(result.file_path).as_posix()
+                in known_new_paths
+            )
+            file_id, is_existing = await self._store_file_record(
+                result.file_path,
+                file_stat,
+                result.language,
+                content_hash,
+                assume_new=assume_new,
+            )
+
+            # Track file_id for single-file case
+            file_ids.append(file_id)
+
+            existing_chunks: list[Chunk]
+            if is_existing:
+                existing_chunks = cast(
+                    list[Chunk],
+                    await self._db.get_chunks_by_file_id_async(file_id, as_model=True),
+                )
+            else:
+                existing_chunks = []
+
+            ids_to_delete, chunks_to_store = self._diff_and_validate_chunks(
+                result, file_id, existing_chunks
+            )
+            if ids_to_delete:
+                await self._db.delete_chunks_batch_async(ids_to_delete)
+            ids = (
+                await self._db.insert_chunks_batch_async(chunks_to_store)
+                if chunks_to_store
+                else []
+            )
+            logger.debug(f"Batch inserted {len(ids)} chunks for file_id {file_id}")
+            stats["chunk_ids_needing_embeddings"].extend(ids)
+            for chunk_id, model in zip(ids, chunks_to_store):
+                stats["chunks_for_embedding"].append((chunk_id, model.to_dict()))
+            stats["total_chunks"] += len(ids)
+            # Count this file as processed successfully (stored or updated)
+            stats["total_files"] += 1
+
+            # Commit per-file; threshold-based checkpointing manages WAL compaction
+            await self._db.commit_transaction_async(force_checkpoint=False)
+
+            self._advance_store_progress(
+                file_task, cumulative_counters, "stored", stats
+            )
+
+        except Exception as e:
+            await self._db.rollback_transaction_async()
+            stats["errors"].append({"file": str(result.file_path), "error": str(e)})
+            self._advance_store_progress(
+                file_task, cumulative_counters, "errors", stats
+            )
 
     async def process_directory(
         self,

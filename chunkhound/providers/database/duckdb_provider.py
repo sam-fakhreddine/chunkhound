@@ -2842,6 +2842,156 @@ class DuckDBProvider(SerialDatabaseProvider):
                     return existing["id"], False
             raise
 
+    async def prepare_files_batch_async(
+        self, files: list[File]
+    ) -> list[tuple[int, bool, list[Chunk]]]:
+        """Upsert many file rows and fetch their existing chunks in ONE dispatch.
+
+        Replaces, for a batch of N files, the per-file sequence of
+        get_file_by_path + insert/update + get_chunks_by_file_id executor
+        round-trips (3N dispatches) with a single dispatch running 4 batched
+        statements. Returns one (file_id, is_existing, existing_chunks) tuple
+        per input file, aligned with input order. existing_chunks is [] for
+        new files; callers diff it exactly as with get_chunks_by_file_id.
+        """
+        return cast(
+            list[tuple[int, bool, list[Chunk]]],
+            await self._execute_in_db_thread("prepare_files_batch", files),
+        )
+
+    def _executor_prepare_files_batch(
+        self, conn: Any, state: dict[str, Any], files: list[File]
+    ) -> list[tuple[int, bool, list[Chunk]]]:
+        """Executor method for prepare_files_batch - runs in DB thread."""
+        if not files:
+            return []
+
+        base_dir = state.get("base_directory")
+        lookup_paths = [
+            normalize_path_for_lookup(str(f.path), base_dir) for f in files
+        ]
+        placeholders = ", ".join(["?"] * len(lookup_paths))
+        rows = conn.execute(
+            f"SELECT id, path FROM files WHERE path IN ({placeholders})",
+            lookup_paths,
+        ).fetchall()
+        existing_by_path = {row[1]: int(row[0]) for row in rows}
+
+        file_ids: list[int | None] = []
+        is_existing_flags: list[bool] = []
+        updates_with_hash: list[tuple[Any, ...]] = []
+        updates_without_hash: list[tuple[Any, ...]] = []
+        new_files: list[File] = []
+        for file, lookup_path in zip(files, lookup_paths):
+            file_id = existing_by_path.get(lookup_path)
+            if file_id is not None:
+                size = file.size_bytes if hasattr(file, "size_bytes") else None
+                mtime = file.mtime if hasattr(file, "mtime") else None
+                content_hash = getattr(file, "content_hash", None)
+                # Mirror _executor_update_file semantics: content_hash is only
+                # written when present; skip_reason is always cleared.
+                if content_hash is not None:
+                    updates_with_hash.append((size, mtime, content_hash, file_id))
+                else:
+                    updates_without_hash.append((size, mtime, file_id))
+                file_ids.append(file_id)
+                is_existing_flags.append(True)
+            else:
+                new_files.append(file)
+                file_ids.append(None)
+                is_existing_flags.append(False)
+
+        if updates_with_hash:
+            conn.executemany(
+                "UPDATE files SET size = ?, modified_time = to_timestamp(?), "
+                "content_hash = ?, skip_reason = NULL, updated_at = now() "
+                "WHERE id = ?",
+                updates_with_hash,
+            )
+        if updates_without_hash:
+            conn.executemany(
+                "UPDATE files SET size = ?, modified_time = to_timestamp(?), "
+                "skip_reason = NULL, updated_at = now() WHERE id = ?",
+                updates_without_hash,
+            )
+
+        if new_files:
+            # Explicit id allocation: executemany has no RETURNING, and id
+            # order must align with input regardless of insertion-order
+            # settings on this connection.
+            new_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    f"SELECT nextval('files_id_seq') FROM range({len(new_files)})"
+                ).fetchall()
+            ]
+            insert_rows = []
+            for new_id, file in zip(new_ids, new_files):
+                insert_rows.append(
+                    (
+                        new_id,
+                        str(file.path),
+                        file.name if hasattr(file, "name") else Path(str(file.path)).name,
+                        file.extension
+                        if hasattr(file, "extension")
+                        else Path(str(file.path)).suffix,
+                        file.size_bytes if hasattr(file, "size_bytes") else None,
+                        file.mtime if hasattr(file, "mtime") else None,
+                        getattr(file, "content_hash", None),
+                        file.language.value if file.language else None,
+                    )
+                )
+            conn.executemany(
+                "INSERT INTO files (id, path, name, extension, size, "
+                "modified_time, content_hash, language) "
+                "VALUES (?, ?, ?, ?, ?, to_timestamp(?), ?, ?)",
+                insert_rows,
+            )
+            new_id_iter = iter(new_ids)
+            file_ids = [
+                fid if fid is not None else next(new_id_iter) for fid in file_ids
+            ]
+
+        resolved_ids = cast(list[int], file_ids)
+
+        existing_ids = [
+            fid for fid, existing in zip(resolved_ids, is_existing_flags) if existing
+        ]
+        chunks_by_file: dict[int, list[Chunk]] = {}
+        if existing_ids:
+            id_placeholders = ", ".join(["?"] * len(existing_ids))
+            chunk_rows = conn.execute(
+                f"""
+                SELECT id, file_id, chunk_type, symbol, code, start_line, end_line,
+                       start_byte, end_byte, language, metadata
+                FROM chunks
+                WHERE file_id IN ({id_placeholders})
+                ORDER BY file_id, start_line, start_byte
+                """,
+                existing_ids,
+            ).fetchall()
+            for row in chunk_rows:
+                chunks_by_file.setdefault(int(row[1]), []).append(
+                    Chunk(
+                        id=row[0],
+                        file_id=row[1],
+                        chunk_type=ChunkType(row[2]),
+                        symbol=row[3],
+                        code=row[4],
+                        start_line=row[5],
+                        end_line=row[6],
+                        start_byte=row[7],
+                        end_byte=row[8],
+                        language=Language(row[9]) if row[9] else None,
+                        metadata=json.loads(row[10]) if row[10] else {},
+                    )
+                )
+
+        return [
+            (fid, existing, chunks_by_file.get(fid, []) if existing else [])
+            for fid, existing in zip(resolved_ids, is_existing_flags)
+        ]
+
     def _executor_insert_file_row(self, conn: Any, file: File) -> int:
         """INSERT one files row and return its id (no existence handling)."""
         result = conn.execute(
@@ -3197,15 +3347,31 @@ class DuckDBProvider(SerialDatabaseProvider):
     def _executor_insert_chunks_batch(
         self, conn: Any, state: dict[str, Any], chunks: list[Chunk]
     ) -> list[int]:
-        """Executor method for insert_chunks_batch - runs in DB thread."""
+        """Executor method for insert_chunks_batch - runs in DB thread.
+
+        Allocates chunk ids from the sequence up front and inserts them
+        explicitly. This keeps the returned id list aligned with the input
+        chunks by construction, instead of relying on RETURNING preserving
+        insertion order (which SET preserve_insertion_order = false — used by
+        bulk-optimized mutations on this connection — would silently break).
+        """
         if not chunks:
             return []
 
+        # Allocate ids first so the id<->chunk mapping is explicit.
+        chunk_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT nextval('chunks_id_seq') FROM range({len(chunks)})"
+            ).fetchall()
+        ]
+
         # Prepare data for bulk insert
         chunk_data = []
-        for chunk in chunks:
+        for chunk_id, chunk in zip(chunk_ids, chunks):
             chunk_data.append(
                 (
+                    chunk_id,
                     chunk.file_id,
                     chunk.chunk_type.value,
                     chunk.symbol or "",
@@ -3225,6 +3391,7 @@ class DuckDBProvider(SerialDatabaseProvider):
         _t0 = _t.perf_counter()
         conn.execute("""
             CREATE TEMPORARY TABLE IF NOT EXISTS temp_chunks (
+                id INTEGER,
                 file_id INTEGER,
                 chunk_type TEXT,
                 symbol TEXT,
@@ -3243,20 +3410,18 @@ class DuckDBProvider(SerialDatabaseProvider):
         # Bulk insert into temp table
         conn.executemany(
             """
-            INSERT INTO temp_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO temp_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             chunk_data,
         )
         _t2 = _t.perf_counter()
-        # Insert from temp to main table with RETURNING
-        result = conn.execute("""
-            INSERT INTO chunks (file_id, chunk_type, symbol, code, start_line, end_line,
+        # Insert from temp to main table (ids preallocated above)
+        conn.execute("""
+            INSERT INTO chunks (id, file_id, chunk_type, symbol, code, start_line, end_line,
                               start_byte, end_byte, language, metadata)
             SELECT * FROM temp_chunks
-            RETURNING id
         """)
         _t3 = _t.perf_counter()
-        chunk_ids = [row[0] for row in result.fetchall()]
         # Reuse temp table across calls; do not drop here
 
         # Update metrics
